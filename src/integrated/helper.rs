@@ -227,10 +227,13 @@ fn run_provider(
     })();
     let _ = control.shutdown(std::net::Shutdown::Both);
     #[cfg(test)]
-    if let Some((arrived, release)) = cleanup_gate {
-        arrived.send(()).unwrap();
-        release.recv_timeout(Duration::from_secs(5)).unwrap();
-    }
+    let cleanup_gate_result = cleanup_gate.map(|(arrived, release)| {
+        // A fixture assertion can drop either peer; still reap the owned provider.
+        arrived.send(()).map_err(io::Error::other)?;
+        release
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(io::Error::other)
+    });
     crate::platform::terminate_recipient_provider(&mut child);
     let reader_deadline = Instant::now() + Duration::from_secs(2);
     for reader in readers {
@@ -244,6 +247,10 @@ fn run_provider(
             ));
         }
         let _ = reader.join();
+    }
+    #[cfg(test)]
+    if let Some(gate_result) = cleanup_gate_result {
+        gate_result?;
     }
     result
 }
@@ -296,7 +303,11 @@ if mode in ['late','queued','queued-reset']:
  sys.exit(0)
 if mode=='wrong': send({'method':'item/agentMessage/delta','params':{'threadId':'replacement','delta':'wrong'}})
 elif mode=='reset':send({'method':'thread/reset','params':{'threadId':'fixed'}})
-elif mode=='overflow': print('x'*1048577,flush=True)
+elif mode=='overflow':
+ # The bounded reader can close between print's text and newline writes.
+ # Keep provider exit from overtaking the queued invalid-frame error.
+ try: print('x'*1048577,flush=True)
+ except BrokenPipeError: pass
 else:
  if mode=='replacement': assert text=='new-instance-body'
  send({'id':a['id'],'result':{'turn':{'id':'accepted-turn'}}})
@@ -336,6 +347,10 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
     #[test]
     fn fake_provider_buffered_input_reset_stays_with_retired_process() {
         fixture("queued-reset");
+    }
+    #[test]
+    fn fake_provider_disconnected_cleanup_barrier_still_reaps_descendant() {
+        fixture("cleanup-disconnected");
     }
     fn replacement_while_old_input_held(old: &mut BufReader<std::net::TcpStream>) {
         use std::io::BufRead;
@@ -401,6 +416,9 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
             owner.wait(pending),
             SubmissionOutcome::Accepted { .. }
         ));
+        // Acceptance precedes turn completion. Observe its final control write
+        // before closing the stream, so shutdown cannot race that Idle frame.
+        owner.wait_for_phase(OwnerState::Idle);
         owner.revoke();
         assert_eq!(
             helper.join().unwrap().unwrap_err().kind(),
@@ -436,15 +454,25 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
         let mut provider = Command::new("python3");
         provider
             .args(["-u", "-c", PROVIDER])
-            .env("HERDR_FIXTURE_MODE", mode)
+            .env(
+                "HERDR_FIXTURE_MODE",
+                if mode == "cleanup-disconnected" {
+                    "late"
+                } else {
+                    mode
+                },
+            )
             .env(
                 "HERDR_FIXTURE_OBSERVER",
                 listener.local_addr().unwrap().port().to_string(),
             );
         let (arrived_tx, arrived_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let gate =
-            matches!(mode, "late" | "queued" | "queued-reset").then_some((arrived_tx, release_rx));
+        let gate = matches!(
+            mode,
+            "late" | "queued" | "queued-reset" | "cleanup-disconnected"
+        )
+        .then_some((arrived_tx, release_rx));
         let helper = std::thread::spawn(move || run_provider(&args, provider, false, gate));
         let (observer, _) = listener.accept().unwrap();
         observer
@@ -484,6 +512,14 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
                 SubmissionOutcome::rejected("revoked_before_write")
             );
             release_tx.send(()).unwrap();
+        } else if mode == "cleanup-disconnected" {
+            assert_eq!(receive(&mut observer), "received:1");
+            owner.revoke();
+            assert_eq!(owner.wait(result), SubmissionOutcome::Unknown);
+            arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Model assertion unwinding after arrival: the release sender drops.
+            // The helper must report that error only after owned cleanup.
+            drop(release_tx);
         } else if mode == "late" {
             assert_eq!(receive(&mut observer), "received:1");
             owner.revoke();
@@ -537,7 +573,15 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
             assert_eq!(owner.wait(result), SubmissionOutcome::Unknown);
         }
         let termination = helper.join().unwrap().unwrap_err();
-        let expected = if matches!(mode, "wrong" | "reset" | "overflow" | "queued-reset") {
+        let expected = if mode == "cleanup-disconnected" {
+            assert_eq!(
+                termination
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<mpsc::RecvTimeoutError>()),
+                Some(&mpsc::RecvTimeoutError::Disconnected)
+            );
+            io::ErrorKind::Other
+        } else if matches!(mode, "wrong" | "reset" | "overflow" | "queued-reset") {
             io::ErrorKind::InvalidData
         } else {
             io::ErrorKind::UnexpectedEof
@@ -545,7 +589,7 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
         assert_eq!(
             termination.kind(),
             expected,
-            "unexpected helper termination: {termination}"
+            "unexpected helper termination in {mode}: {termination}"
         );
         // run_provider joins all three readers before returning anything but Timeout.
         // Independently observe that the descendant which retained both pipes is dead.
