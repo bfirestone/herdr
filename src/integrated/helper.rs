@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use crate::integrated::{Owner, OwnerState, SubmissionOutcome};
     const PROVIDER: &str = r#"
-import json,sys,os,subprocess,socket
+import json,sys,os,subprocess,socket,select
 # A descendant deliberately retains the provider pipes until owned group cleanup.
 descendant=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"])
 observer=socket.create_connection(('127.0.0.1',int(os.environ['HERDR_FIXTURE_OBSERVER'])))
@@ -266,6 +266,22 @@ def send(x): print(json.dumps(x),flush=True)
 a=read();send({'id':a['id'],'result':{'userAgent':'codex/0.154.0'}})
 assert read()['method']=='initialized'
 a=read();send({'id':a['id'],'result':{'thread':{'id':'fixed'},'cwd':os.getcwd(),'approvalPolicy':'on-request','sandbox':{'type':'readOnly'}}})
+mode=os.environ['HERDR_FIXTURE_MODE']
+if mode in ['queued','queued-reset','replacement']:
+ observe('holding-input')
+ await_release()
+ if mode in ['queued','queued-reset']:
+  assert select.select([sys.stdin],[],[],5)[0], 'provider input was not buffered'
+  observe('input-buffered')
+ if mode=='queued': await_release()
+ if mode=='queued-reset':
+  send({'method':'thread/reset','params':{'threadId':'fixed'}})
+  observe('reset-sent')
+  await_release()
+ if mode=='replacement':
+  assert not select.select([sys.stdin],[],[],0)[0], 'replacement received old bytes'
+  observe('empty-input')
+  await_release()
 a=read();assert a['method']=='turn/start';assert a['params']['threadId']=='fixed'
 text=a['params']['input'][0]['text']
 assert text not in str(sys.argv) and text not in str(dict(os.environ))
@@ -273,7 +289,7 @@ assert os.listdir('.')==[]
 mode=os.environ['HERDR_FIXTURE_MODE']
 observe('received:1')
 if mode in ['busy','late']: await_release()
-if mode=='late':
+if mode in ['late','queued','queued-reset']:
  send({'id':a['id'],'result':{'turn':{'id':'late-turn'}}})
  observe('late-sent')
  sys.stdin.read()
@@ -282,6 +298,7 @@ if mode=='wrong': send({'method':'item/agentMessage/delta','params':{'threadId':
 elif mode=='reset':send({'method':'thread/reset','params':{'threadId':'fixed'}})
 elif mode=='overflow': print('x'*1048577,flush=True)
 else:
+ if mode=='replacement': assert text=='new-instance-body'
  send({'id':a['id'],'result':{'turn':{'id':'accepted-turn'}}})
  if mode=='busy': await_release()
  send({'method':'turn/completed','params':{'threadId':'fixed','turn':{'id':'accepted-turn'}}})
@@ -311,6 +328,85 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
     #[test]
     fn fake_provider_late_ack_after_retirement_cannot_revive_owner() {
         fixture("late");
+    }
+    #[test]
+    fn fake_provider_queued_input_stays_with_retired_process_across_replacement() {
+        fixture("queued");
+    }
+    #[test]
+    fn fake_provider_buffered_input_reset_stays_with_retired_process() {
+        fixture("queued-reset");
+    }
+    fn replacement_while_old_input_held(old: &mut BufReader<std::net::TcpStream>) {
+        use std::io::BufRead;
+        fn observed(reader: &mut BufReader<std::net::TcpStream>) -> String {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line.trim_end().to_owned()
+        }
+        let bootstrap = crate::platform::RecipientBootstrap::new().unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-replacement-{}",
+            crate::platform::recipient_random().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let args = vec![
+            bootstrap.path().to_string_lossy().into_owned(),
+            bootstrap.nonce.clone(),
+            directory.to_string_lossy().into_owned(),
+        ];
+        let owner = Owner::launch(
+            RecipientIdentity {
+                server_instance: "test-server".into(),
+                recipient_token: "replacement-recipient".into(),
+                terminal_id: "test-terminal".into(),
+            },
+            bootstrap,
+            std::process::id(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut provider = Command::new("python3");
+        provider
+            .args(["-u", "-c", PROVIDER])
+            .env("HERDR_FIXTURE_MODE", "replacement")
+            .env(
+                "HERDR_FIXTURE_OBSERVER",
+                listener.local_addr().unwrap().port().to_string(),
+            );
+        let helper = std::thread::spawn(move || run_provider(&args, provider, false, None));
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut observer = BufReader::new(stream);
+        let _descendant: u32 = observed(&mut observer).parse().unwrap();
+        owner.wait_for_phase(OwnerState::Idle);
+        assert_eq!(observed(&mut observer), "holding-input");
+        // Release A only after the replacement has its own initialized process.
+        old.get_mut().write_all(b"continue\n").unwrap();
+        assert_eq!(observed(old), "received:1");
+        assert_eq!(observed(old), "late-sent");
+        observer.get_mut().write_all(b"continue\n").unwrap();
+        assert_eq!(observed(&mut observer), "empty-input");
+        assert_eq!(owner.state(), OwnerState::Idle);
+        // A separate B proves that the replacement pipe is live, not a dead sink.
+        let pending = owner
+            .reserve(&owner.identity, "new-request", "new-instance-body")
+            .unwrap();
+        owner.forward("new-request", "new-instance-body");
+        observer.get_mut().write_all(b"continue\n").unwrap();
+        assert_eq!(observed(&mut observer), "received:1");
+        assert!(matches!(
+            owner.wait(pending),
+            SubmissionOutcome::Accepted { .. }
+        ));
+        owner.revoke();
+        assert_eq!(
+            helper.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        std::fs::remove_dir(directory).unwrap();
     }
     fn fixture(mode: &str) {
         let Ok(bootstrap) = crate::platform::RecipientBootstrap::new() else {
@@ -347,7 +443,8 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
             );
         let (arrived_tx, arrived_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let gate = (mode == "late").then_some((arrived_tx, release_rx));
+        let gate =
+            matches!(mode, "late" | "queued" | "queued-reset").then_some((arrived_tx, release_rx));
         let helper = std::thread::spawn(move || run_provider(&args, provider, false, gate));
         let (observer, _) = listener.accept().unwrap();
         observer
@@ -365,8 +462,30 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
         let prompt = "private-fixture-body-79c6\nquote ' \" end";
         let result = owner.reserve(&owner.identity, "request1", prompt).unwrap();
         owner.forward("request1", prompt);
-        assert_eq!(receive(&mut observer), "received:1");
-        if mode == "late" {
+        if matches!(mode, "queued" | "queued-reset") {
+            assert_eq!(receive(&mut observer), "holding-input");
+            observer.get_mut().write_all(b"continue\n").unwrap();
+            assert_eq!(receive(&mut observer), "input-buffered");
+            if mode == "queued-reset" {
+                assert_eq!(receive(&mut observer), "reset-sent");
+            } else {
+                owner.revoke();
+            }
+            assert_eq!(owner.wait(result), SubmissionOutcome::Unknown);
+            // The production loop has stopped but the old provider is kept alive
+            // by the existing test-only cleanup barrier, with A still unread.
+            arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            replacement_while_old_input_held(&mut observer);
+            assert_eq!(owner.state(), OwnerState::Revoked);
+            assert_eq!(
+                owner
+                    .reserve(&owner.identity, "retired", prompt)
+                    .unwrap_err(),
+                SubmissionOutcome::rejected("revoked_before_write")
+            );
+            release_tx.send(()).unwrap();
+        } else if mode == "late" {
+            assert_eq!(receive(&mut observer), "received:1");
             owner.revoke();
             assert_eq!(owner.wait(result), SubmissionOutcome::Unknown);
             arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -381,6 +500,7 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
             );
             release_tx.send(()).unwrap();
         } else if mode == "accept" || mode == "busy" {
+            assert_eq!(receive(&mut observer), "received:1");
             if mode == "busy" {
                 assert_eq!(
                     owner
@@ -413,10 +533,11 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
             ));
             owner.revoke();
         } else {
+            assert_eq!(receive(&mut observer), "received:1");
             assert_eq!(owner.wait(result), SubmissionOutcome::Unknown);
         }
         let termination = helper.join().unwrap().unwrap_err();
-        let expected = if matches!(mode, "wrong" | "reset" | "overflow") {
+        let expected = if matches!(mode, "wrong" | "reset" | "overflow" | "queued-reset") {
             io::ErrorKind::InvalidData
         } else {
             io::ErrorKind::UnexpectedEof
