@@ -16,10 +16,21 @@ use std::{
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
     let mut command = Command::new("codex");
     command.args(["app-server", "--listen", "stdio://"]);
-    run_provider(args, command, true)
+    run_provider(
+        args,
+        command,
+        true,
+        #[cfg(test)]
+        None,
+    )
 }
 
-fn run_provider(args: &[String], mut command: Command, render_enabled: bool) -> io::Result<()> {
+fn run_provider(
+    args: &[String],
+    mut command: Command,
+    render_enabled: bool,
+    #[cfg(test)] cleanup_gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+) -> io::Result<()> {
     let [path, nonce, cwd] = args else {
         return Err(io::ErrorKind::InvalidInput.into());
     };
@@ -215,6 +226,11 @@ fn run_provider(args: &[String], mut command: Command, render_enabled: bool) -> 
         session
     })();
     let _ = control.shutdown(std::net::Shutdown::Both);
+    #[cfg(test)]
+    if let Some((arrived, release)) = cleanup_gate {
+        arrived.send(()).unwrap();
+        release.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
     crate::platform::terminate_recipient_provider(&mut child);
     let reader_deadline = Instant::now() + Duration::from_secs(2);
     for reader in readers {
@@ -237,9 +253,14 @@ mod tests {
     use super::*;
     use crate::integrated::{Owner, OwnerState, SubmissionOutcome};
     const PROVIDER: &str = r#"
-import json,sys,os,subprocess
+import json,sys,os,subprocess,socket
 # A descendant deliberately retains the provider pipes until owned group cleanup.
-subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"])
+descendant=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"])
+observer=socket.create_connection(('127.0.0.1',int(os.environ['HERDR_FIXTURE_OBSERVER'])))
+sync=observer.makefile('rwb',buffering=0)
+def observe(value): sync.write((value+'\n').encode())
+def await_release(): assert sync.readline()==b'continue\n'
+observe(str(descendant.pid))
 read=lambda:json.loads(sys.stdin.readline())
 def send(x): print(json.dumps(x),flush=True)
 a=read();send({'id':a['id'],'result':{'userAgent':'codex/0.154.0'}})
@@ -250,16 +271,28 @@ text=a['params']['input'][0]['text']
 assert text not in str(sys.argv) and text not in str(dict(os.environ))
 assert os.listdir('.')==[]
 mode=os.environ['HERDR_FIXTURE_MODE']
+observe('received:1')
+if mode in ['busy','late']: await_release()
+if mode=='late':
+ send({'id':a['id'],'result':{'turn':{'id':'late-turn'}}})
+ observe('late-sent')
+ sys.stdin.read()
+ sys.exit(0)
 if mode=='wrong': send({'method':'item/agentMessage/delta','params':{'threadId':'replacement','delta':'wrong'}})
 elif mode=='reset':send({'method':'thread/reset','params':{'threadId':'fixed'}})
 elif mode=='overflow': print('x'*1048577,flush=True)
 else:
  send({'id':a['id'],'result':{'turn':{'id':'accepted-turn'}}})
+ if mode=='busy': await_release()
  send({'method':'turn/completed','params':{'threadId':'fixed','turn':{'id':'accepted-turn'}}})
  # With no renderer/client attached, the process remains alive to admit a second input.
- a=read();send({'id':a['id'],'result':{'turn':{'id':'second-turn'}}})
+ a=read();assert a['method']=='turn/start'
+ observe('received:2')
+ send({'id':a['id'],'result':{'turn':{'id':'second-turn'}}})
  # Wait for owned cleanup rather than racing the acknowledgment with process exit.
  sys.stdin.read()
+# Keep EOF from racing the specific protocol violation being tested.
+if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
 "#;
     #[test]
     fn fake_provider_process_has_private_body_and_survives_absent_renderer() {
@@ -270,6 +303,14 @@ else:
         for mode in ["wrong", "reset", "overflow"] {
             fixture(mode);
         }
+    }
+    #[test]
+    fn fake_provider_pending_and_active_turn_admission_forwards_only_one_input() {
+        fixture("busy");
+    }
+    #[test]
+    fn fake_provider_late_ack_after_retirement_cannot_revive_owner() {
+        fixture("late");
     }
     fn fixture(mode: &str) {
         let Ok(bootstrap) = crate::platform::RecipientBootstrap::new() else {
@@ -295,23 +336,77 @@ else:
             bootstrap,
             std::process::id(),
         );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut provider = Command::new("python3");
         provider
             .args(["-u", "-c", PROVIDER])
-            .env("HERDR_FIXTURE_MODE", mode);
-        let helper = std::thread::spawn(move || run_provider(&args, provider, false));
+            .env("HERDR_FIXTURE_MODE", mode)
+            .env(
+                "HERDR_FIXTURE_OBSERVER",
+                listener.local_addr().unwrap().port().to_string(),
+            );
+        let (arrived_tx, arrived_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let gate = (mode == "late").then_some((arrived_tx, release_rx));
+        let helper = std::thread::spawn(move || run_provider(&args, provider, false, gate));
+        let (observer, _) = listener.accept().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut observer = BufReader::new(observer);
+        let receive = |reader: &mut BufReader<std::net::TcpStream>| {
+            use std::io::BufRead;
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line.trim_end().to_owned()
+        };
+        let descendant: u32 = receive(&mut observer).parse().unwrap();
         owner.wait_for_phase(OwnerState::Idle);
         let prompt = "private-fixture-body-79c6\nquote ' \" end";
         let result = owner.reserve(&owner.identity, "request1", prompt).unwrap();
         owner.forward("request1", prompt);
-        if mode == "accept" {
+        assert_eq!(receive(&mut observer), "received:1");
+        if mode == "late" {
+            owner.revoke();
+            assert_eq!(owner.wait(result), SubmissionOutcome::Unknown);
+            arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            observer.get_mut().write_all(b"continue\n").unwrap();
+            assert_eq!(receive(&mut observer), "late-sent");
+            assert_eq!(owner.state(), OwnerState::Revoked);
+            assert_eq!(
+                owner
+                    .reserve(&owner.identity, "late-retry", prompt)
+                    .unwrap_err(),
+                SubmissionOutcome::rejected("revoked_before_write")
+            );
+            release_tx.send(()).unwrap();
+        } else if mode == "accept" || mode == "busy" {
+            if mode == "busy" {
+                assert_eq!(
+                    owner
+                        .reserve(&owner.identity, "pending-duplicate", prompt)
+                        .unwrap_err(),
+                    SubmissionOutcome::rejected("queue_full")
+                );
+                observer.get_mut().write_all(b"continue\n").unwrap();
+            }
             assert!(matches!(
                 owner.wait(result),
                 SubmissionOutcome::Accepted { .. }
             ));
+            if mode == "busy" {
+                assert_eq!(
+                    owner
+                        .reserve(&owner.identity, "active-duplicate", prompt)
+                        .unwrap_err(),
+                    SubmissionOutcome::rejected("not_ready")
+                );
+                observer.get_mut().write_all(b"continue\n").unwrap();
+            }
             owner.wait_for_phase(OwnerState::Idle);
             let result = owner.reserve(&owner.identity, "request2", prompt).unwrap();
             owner.forward("request2", prompt);
+            assert_eq!(receive(&mut observer), "received:2");
             assert!(matches!(
                 owner.wait(result),
                 SubmissionOutcome::Accepted { .. }
@@ -320,7 +415,36 @@ else:
         } else {
             assert_eq!(owner.wait(result), SubmissionOutcome::Unknown);
         }
-        let _ = helper.join().unwrap();
+        let termination = helper.join().unwrap().unwrap_err();
+        let expected = if matches!(mode, "wrong" | "reset" | "overflow") {
+            io::ErrorKind::InvalidData
+        } else {
+            io::ErrorKind::UnexpectedEof
+        };
+        assert_eq!(
+            termination.kind(),
+            expected,
+            "unexpected helper termination: {termination}"
+        );
+        // run_provider joins all three readers before returning anything but Timeout.
+        // Independently observe that the descendant which retained both pipes is dead.
+        let status = Command::new("python3")
+            .args([
+                "-c",
+                r#"
+import os,sys,time
+pid=int(sys.argv[1]);deadline=time.monotonic()+3
+while True:
+ try: os.kill(pid,0)
+ except ProcessLookupError: break
+ assert time.monotonic()<deadline, 'owned descendant remained alive'
+ time.sleep(.01)
+"#,
+                &descendant.to_string(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
         owner.wait_for_phase(OwnerState::Revoked);
         assert!(std::fs::read_dir(&directory).unwrap().next().is_none());
         std::fs::remove_dir(directory).unwrap();

@@ -30,6 +30,7 @@ impl Approvals {
             || params["turnId"] != turn
             || (method != "mcpServer/elicitation/request"
                 && params["itemId"].as_str().is_none_or(str::is_empty))
+            || item.is_some_and(|item| item["id"] != params["itemId"])
             || self.cards.len() >= 16
             || self.seen.contains(&id.to_string())
             || self.seen.len() >= 4096
@@ -334,6 +335,17 @@ fn valid_form_content(schema: &Value, content: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supplied_command_item_must_match_request_but_is_not_required() {
+        let request = json!({"id":41,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread","turnId":"turn","itemId":"operation","startedAtMs":0,"command":"printf safe","cwd":"/tmp"}});
+        let mut approvals = Approvals::default();
+        let item = json!({"type":"commandExecution","id":"other-operation","command":"printf safe","cwd":"/tmp"});
+        assert!(approvals
+            .insert(&request, "thread", "turn", Some(&item))
+            .is_err());
+        assert!(approvals.cards().is_empty());
+        approvals.insert(&request, "thread", "turn", None).unwrap();
+    }
     #[test]
     fn binds_operation_and_invalidates_resolved_cards() {
         let mut approvals = Approvals::default();

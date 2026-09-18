@@ -315,20 +315,25 @@ fn parse_integrated_start(
     })
 }
 
-fn agent_start(args: &[String]) -> std::io::Result<i32> {
-    if args.iter().any(|arg| arg == "--integrated") {
-        let Some(params) = parse_integrated_start(args) else {
+enum StartMode {
+    Integrated(crate::api::schema::AgentStartIntegratedParams),
+    Legacy(AgentStartParams),
+}
+
+fn parse_start_mode(args: &[String]) -> Result<StartMode, i32> {
+    if args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--integrated")
+    {
+        return parse_integrated_start(args).map(StartMode::Integrated).ok_or_else(|| {
             eprintln!("usage: herdr agent start --integrated codex --workspace WORKSPACE_ID --cwd TRUSTED_ABSOLUTE_PATH");
-            return Ok(2);
-        };
-        return super::print_response(&super::send_request(&Request {
-            id: "cli:agent:start_integrated".into(),
-            method: Method::AgentStartIntegrated(params),
-        })?);
+            2
+        });
     }
     let Some(name) = args.first() else {
         eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
-        return Ok(2);
+        return Err(2);
     };
     let separator = args
         .iter()
@@ -343,7 +348,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--kind" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --kind");
-                    return Ok(2);
+                    return Err(2);
                 };
                 kind = Some(value.clone());
                 index += 2;
@@ -351,7 +356,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--pane" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --pane");
-                    return Ok(2);
+                    return Err(2);
                 };
                 pane_id = Some(super::normalize_pane_id(value));
                 index += 2;
@@ -359,38 +364,63 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--timeout" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --timeout");
-                    return Ok(2);
+                    return Err(2);
                 };
-                timeout_ms = match parse_timeout(value) {
-                    Ok(timeout_ms) => Some(timeout_ms),
-                    Err(exit_code) => return Ok(exit_code),
-                };
+                timeout_ms = Some(parse_timeout(value)?);
                 index += 2;
             }
             other => {
                 eprintln!("unknown option: {other}");
-                return Ok(2);
+                return Err(2);
             }
         }
     }
     let Some(kind) = kind else {
         eprintln!("missing required --kind");
-        return Ok(2);
+        return Err(2);
     };
     let Some(pane_id) = pane_id else {
         eprintln!("missing required --pane");
-        return Ok(2);
+        return Err(2);
     };
-    let Some(expected_kind) = crate::detect::parse_agent_label(&kind) else {
+    let Some(_) = crate::detect::parse_agent_label(&kind) else {
         eprintln!("unsupported interactive agent kind: {kind}");
-        return Ok(2);
+        return Err(2);
     };
-    let expected_kind = crate::detect::agent_label(expected_kind).to_string();
     let agent_args = if separator < args.len() {
         args[separator + 1..].to_vec()
     } else {
         Vec::new()
     };
+    Ok(StartMode::Legacy(AgentStartParams {
+        name: name.clone(),
+        kind,
+        pane_id,
+        args: agent_args,
+        timeout_ms,
+    }))
+}
+
+fn agent_start(args: &[String]) -> std::io::Result<i32> {
+    let params = match parse_start_mode(args) {
+        Ok(StartMode::Integrated(params)) => {
+            return super::print_response(&super::send_request(&Request {
+                id: "cli:agent:start_integrated".into(),
+                method: Method::AgentStartIntegrated(params),
+            })?)
+        }
+        Ok(StartMode::Legacy(params)) => params,
+        Err(code) => return Ok(code),
+    };
+    let AgentStartParams {
+        name,
+        kind,
+        pane_id,
+        args: agent_args,
+        timeout_ms,
+    } = params;
+    let expected_kind =
+        crate::detect::agent_label(crate::detect::parse_agent_label(&kind).unwrap()).to_string();
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
     let retryable_timeout = timeout > crate::app::AGENT_START_SETTLE_DELAY
         && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
@@ -453,10 +483,10 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         .as_deref()
         .is_some_and(|pinned| pinned != expected_terminal_id)
     {
-        return super::print_response(&agent_name_lost_error("cli:agent:start", name));
+        return super::print_response(&agent_name_lost_error("cli:agent:start", &name));
     }
     let waited = wait_for_named_agent(
-        name,
+        &name,
         &pane_id,
         timeout,
         &expected_kind,
@@ -989,4 +1019,52 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod integrated_start_tests {
+    use super::*;
+    #[test]
+    fn integrated_route_and_legacy_forwarding_respect_separator() {
+        let args: Vec<String> = [
+            "worker",
+            "--kind",
+            "codex",
+            "--pane",
+            "w1:p1",
+            "--",
+            "--integrated",
+            "value",
+            "--cwd",
+            "provider-cwd",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let Ok(StartMode::Legacy(params)) = parse_start_mode(&args) else {
+            panic!("legacy provider arguments changed route");
+        };
+        assert_eq!(params.name, "worker");
+        assert_eq!(params.pane_id, "w1:p1");
+        assert_eq!(
+            params.args,
+            ["--integrated", "value", "--cwd", "provider-cwd"]
+        );
+        let args: Vec<String> = [
+            "--integrated",
+            "codex",
+            "--workspace",
+            "w1",
+            "--cwd",
+            "/tmp/trusted",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let Ok(StartMode::Integrated(params)) = parse_start_mode(&args) else {
+            panic!("explicit integrated route rejected");
+        };
+        assert_eq!(params.workspace_id, "w1");
+        assert_eq!(params.cwd, "/tmp/trusted");
+    }
 }

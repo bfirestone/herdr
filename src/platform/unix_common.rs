@@ -613,7 +613,23 @@ impl std::io::Write for RecipientProviderInput {
 
 #[cfg(test)]
 pub(crate) fn recipient_test_pair() -> std::io::Result<(RecipientStream, RecipientStream)> {
-    RecipientStream::pair()
+    use std::os::fd::AsRawFd;
+    let (stream, peer) = RecipientStream::pair()?;
+    let capacity: libc::c_int = 1024;
+    // Small actual kernel buffer makes partial-write fixtures deterministic.
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&capacity as *const libc::c_int).cast(),
+            std::mem::size_of_val(&capacity) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((stream, peer))
 }
 
 #[cfg(test)]

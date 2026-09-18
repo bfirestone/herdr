@@ -110,7 +110,10 @@ impl App {
             .terminals
             .values()
             .find(|terminal| terminal.id.to_string() == target.terminal_id)
-            .is_some_and(|terminal| terminal.is_agent_terminal())
+            .is_some_and(|terminal| {
+                terminal.is_agent_terminal()
+                    || self.integrated_owners.contains_key(terminal.id.as_str())
+            })
     }
 
     fn single_terminal_match(

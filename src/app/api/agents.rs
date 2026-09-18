@@ -140,6 +140,13 @@ impl App {
         else {
             return Err(agent_not_found(id, &params.target));
         };
+        if self.integrated_owners.contains_key(terminal_id.as_str()) {
+            return Err(encode_error(
+                id,
+                "unsupported_recipient",
+                "integrated recipients require the exact prompt channel",
+            ));
+        }
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
         };

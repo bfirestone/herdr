@@ -281,6 +281,20 @@ impl Owner {
 
 #[cfg(test)]
 impl Owner {
+    pub(crate) fn test_starting(identity: RecipientIdentity) -> Arc<Self> {
+        Arc::new(Self {
+            identity,
+            stream: OnceLock::new(),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            observed: std::sync::Condvar::new(),
+            state: Mutex::new(State {
+                phase: OwnerState::Starting,
+                seen: HashSet::new(),
+                pending: None,
+            }),
+        })
+    }
+
     pub(super) fn wait_for_phase(&self, phase: OwnerState) {
         let state = self.state.lock().unwrap();
         let (state, timeout) = self
@@ -315,6 +329,48 @@ mod tests {
             }),
         };
         Some((owner, peer))
+    }
+    #[test]
+    fn actual_partial_owner_write_disconnect_never_rebinds_or_delivers_to_replacement() {
+        let Some((owner, mut peer)) = connected() else {
+            return;
+        };
+        let owner = Arc::new(owner);
+        // Escaping doubles the body beyond the explicitly small kernel send buffer.
+        let text = "\\".repeat(65536);
+        let pending = owner.reserve(&owner.identity, "partial", &text).unwrap();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let writer = {
+            let owner = owner.clone();
+            std::thread::spawn(move || {
+                owner.forward("partial", &text);
+                done_tx.send(()).unwrap();
+            })
+        };
+        let mut prefix = [0u8; 64];
+        peer.read_exact(&mut prefix).unwrap();
+        assert!(!prefix.contains(&b'\n'));
+        // Receipt of a real prefix is the barrier; the complete frame cannot fit.
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        peer.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(peer);
+        owner.revoke();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+        assert_eq!(owner.wait(pending), SubmissionOutcome::Unknown);
+        assert_eq!(owner.state(), OwnerState::Revoked);
+        let (replacement, mut replacement_peer) = crate::platform::recipient_test_pair().unwrap();
+        assert!(owner.stream.set(replacement).is_err());
+        owner.forward("partial", "must never replay");
+        assert_eq!(
+            owner
+                .reserve(&owner.identity, "later", "no delivery")
+                .unwrap_err(),
+            SubmissionOutcome::rejected("revoked_before_write")
+        );
+        let mut received = Vec::new();
+        replacement_peer.read_to_end(&mut received).unwrap();
+        assert!(received.is_empty());
     }
     #[test]
     fn stale_identities_and_queued_replacement_receive_zero_bytes() {

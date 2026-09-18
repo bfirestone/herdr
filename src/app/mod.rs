@@ -2471,6 +2471,67 @@ mod tests {
     }
 
     #[test]
+    fn integrated_owner_is_resolved_through_retirement_and_replacement() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("integrated-target");
+        let pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane).unwrap().to_string();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let pane_id = app.public_pane_id(0, pane).unwrap();
+        let owner = crate::integrated::Owner::test_starting(crate::integrated::RecipientIdentity {
+            server_instance: "s".into(),
+            recipient_token: "a".into(),
+            terminal_id: terminal_id.clone(),
+        });
+        app.integrated_owners
+            .insert(terminal_id.clone(), owner.clone());
+        assert_eq!(app.collect_agent_infos().len(), 1);
+        assert_eq!(
+            app.resolve_agent_target(&pane_id).unwrap().terminal_id,
+            terminal_id
+        );
+        assert!(app.agent_info_for_target(&pane_id).is_ok());
+        assert!(app.focus_agent_target(&pane_id).is_ok());
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(app.handle_deferred_agent_api_request(
+            crate::api::schema::Request {
+                id: "legacy-integrated-prompt".into(),
+                method: crate::api::schema::Method::AgentPrompt(
+                    crate::api::schema::AgentPromptParams {
+                        target: pane_id.clone(),
+                        text: "must not reach PTY".into(),
+                        wait: None,
+                    }
+                ),
+            },
+            tx
+        ));
+        let response = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "unsupported_recipient");
+
+        owner.revoke();
+        // A retired owner remains discoverable as unknown while its pane remains.
+        assert!(app.resolve_agent_target(&pane_id).is_ok());
+        assert_eq!(
+            app.agent_info_for_target(&pane_id).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Unknown
+        );
+        app.integrated_owners.remove(&terminal_id);
+        assert!(app.resolve_agent_target(&pane_id).is_err());
+        let replacement =
+            crate::integrated::Owner::test_starting(crate::integrated::RecipientIdentity {
+                recipient_token: "b".into(),
+                ..owner.identity.clone()
+            });
+        app.integrated_owners
+            .insert(terminal_id, replacement.clone());
+        assert!(app.agent_info_for_target(&pane_id).is_ok());
+        replacement.revoke();
+    }
+
+    #[test]
     fn agent_target_rejects_a_pane_that_only_has_a_launch_command() {
         let mut app = test_app();
         let workspace = Workspace::test_new("terminal-target-command");
