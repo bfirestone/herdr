@@ -371,19 +371,32 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
-        if !terminal.is_agent_terminal() {
+        let integrated = self.integrated_owners.get(terminal.id.as_str());
+        if !terminal.is_agent_terminal() && integrated.is_none() {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
         Some(crate::api::schema::AgentInfo {
+            exact_prompt: None,
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
-            agent: pane.agent,
+            agent: integrated.map(|_| "codex".to_owned()).or(pane.agent),
             title: pane.title,
             terminal_title: pane.terminal_title,
             terminal_title_stripped: pane.terminal_title_stripped,
             display_agent: pane.display_agent,
-            agent_status: pane.agent_status,
+            agent_status: integrated
+                .map(|owner| match owner.state() {
+                    crate::integrated::OwnerState::Idle => crate::api::schema::AgentStatus::Idle,
+                    crate::integrated::OwnerState::ActiveTurn => {
+                        crate::api::schema::AgentStatus::Working
+                    }
+                    crate::integrated::OwnerState::PendingPermission => {
+                        crate::api::schema::AgentStatus::Blocked
+                    }
+                    _ => crate::api::schema::AgentStatus::Unknown,
+                })
+                .unwrap_or(pane.agent_status),
             screen_detection_skipped: terminal.full_lifecycle_hook_authority_active(),
             state_labels: pane.state_labels,
             tokens: pane.tokens,
@@ -412,6 +425,93 @@ impl App {
                 agent.name.as_deref() == Some(name) && agent.terminal_id != except_terminal_id
             })
             .collect()
+    }
+}
+
+impl App {
+    pub(super) fn start_integrated_codex(
+        &mut self,
+        params: crate::api::schema::AgentStartIntegratedParams,
+    ) -> std::io::Result<(
+        crate::api::schema::AgentInfo,
+        crate::integrated::RecipientIdentity,
+    )> {
+        self.integrated_owners
+            .retain(|_, owner| owner.state() != crate::integrated::OwnerState::Revoked);
+        if self.integrated_owners.len() >= 128 {
+            return Err(std::io::Error::other("integrated recipient limit reached"));
+        }
+        if params.provider != "codex" {
+            return Err(std::io::ErrorKind::Unsupported.into());
+        }
+        let ws_idx = self
+            .parse_workspace_id(&params.workspace_id)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        let cwd = std::path::PathBuf::from(&params.cwd);
+        if !cwd.is_absolute() || !cwd.is_dir() || cwd.canonicalize()? != cwd {
+            return Err(std::io::Error::other(
+                "select an existing canonical absolute trusted cwd",
+            ));
+        }
+        let workspace = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        if !cwd.starts_with(workspace.identity_cwd.canonicalize()?) {
+            return Err(std::io::Error::other(
+                "trusted cwd must be inside the selected workspace",
+            ));
+        }
+        let server_instance = self
+            .integrated_server_instance
+            .clone()
+            .ok_or(std::io::ErrorKind::Unsupported)?;
+        let bootstrap = crate::platform::RecipientBootstrap::new()?;
+        let token = crate::platform::recipient_random()?;
+        let argv = vec![
+            crate::platform::launch_executable()?
+                .to_string_lossy()
+                .into_owned(),
+            "integrated-agent-pane".into(),
+            bootstrap.path().to_string_lossy().into_owned(),
+            bootstrap.nonce.clone(),
+            params.cwd,
+        ];
+        let (rows, cols) = self.state.estimate_pane_size();
+        let (tab_idx, terminal, mut runtime) = self.state.workspaces[ws_idx]
+            .create_tab_argv_command(
+                rows,
+                cols,
+                cwd,
+                &argv,
+                vec![],
+                self.state.pane_scrollback_limit_bytes,
+                self.state.host_terminal_theme,
+                self.state.host_terminal_appearance,
+            )?;
+        let pid = runtime.child_pid().ok_or(std::io::ErrorKind::Unsupported)?;
+        let terminal_id = terminal.id.clone();
+        let identity = crate::integrated::RecipientIdentity {
+            server_instance,
+            recipient_token: token,
+            terminal_id: terminal_id.to_string(),
+        };
+        let owner = crate::integrated::Owner::launch(identity.clone(), bootstrap, pid);
+        runtime.bind_integrated_owner(owner.lease());
+        self.integrated_owners
+            .insert(identity.terminal_id.clone(), owner);
+        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        self.state.terminals.insert(terminal_id, terminal);
+        self.state.switch_workspace_tab(ws_idx, tab_idx);
+        self.state.mode = super::Mode::Terminal;
+        self.schedule_session_save();
+        self.emit_tab_created_events(ws_idx, tab_idx);
+        let pane_id = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
+        let agent = self
+            .agent_info(ws_idx, pane_id)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        Ok((agent, identity))
     }
 }
 

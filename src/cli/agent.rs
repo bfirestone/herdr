@@ -286,7 +286,46 @@ fn matched_rule_region_preview<'a>(
         .filter(|preview| !preview.is_empty())
 }
 
+fn parse_integrated_start(
+    args: &[String],
+) -> Option<crate::api::schema::AgentStartIntegratedParams> {
+    if args.len() != 6 {
+        return None;
+    }
+    let (mut provider, mut workspace_id, mut cwd) = (None, None, None);
+    for [flag, value] in args.as_chunks::<2>().0 {
+        let field = match flag.as_str() {
+            "--integrated" => &mut provider,
+            "--workspace" => &mut workspace_id,
+            "--cwd" => &mut cwd,
+            _ => return None,
+        };
+        if field.replace(value.clone()).is_some() {
+            return None;
+        }
+    }
+    let provider = provider?;
+    if provider != "codex" {
+        return None;
+    }
+    Some(crate::api::schema::AgentStartIntegratedParams {
+        provider,
+        workspace_id: workspace_id?,
+        cwd: cwd?,
+    })
+}
+
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
+    if args.iter().any(|arg| arg == "--integrated") {
+        let Some(params) = parse_integrated_start(args) else {
+            eprintln!("usage: herdr agent start --integrated codex --workspace WORKSPACE_ID --cwd TRUSTED_ABSOLUTE_PATH");
+            return Ok(2);
+        };
+        return super::print_response(&super::send_request(&Request {
+            id: "cli:agent:start_integrated".into(),
+            method: Method::AgentStartIntegrated(params),
+        })?);
+    }
     let Some(name) = args.first() else {
         eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
         return Ok(2);

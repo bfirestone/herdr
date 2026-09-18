@@ -185,6 +185,8 @@ pub struct AgentPromptParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_prompt: Option<ExactPromptRecipient>,
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -231,4 +233,31 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+}
+
+/// Explicit integrated launch; never changes legacy agent.start semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStartIntegratedParams {
+    pub provider: String,
+    pub workspace_id: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPromptExactParams {
+    pub terminal_id: String,
+    pub server_instance: String,
+    pub recipient_token: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExactPromptRecipient {
+    pub version: u32,
+    pub recipient_token: String,
+    pub server_instance: String,
+    pub transport: String,
+    pub ready: bool,
 }

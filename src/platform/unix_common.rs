@@ -475,3 +475,271 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
+
+/// A one-shot rendezvous. Only this newly created directory is ever removed.
+pub(crate) struct RecipientBootstrap {
+    listener: std::os::unix::net::UnixListener,
+    directory: PathBuf,
+    pub(crate) nonce: String,
+}
+
+pub(crate) type RecipientStream = std::os::unix::net::UnixStream;
+
+pub(crate) fn recipient_random() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+impl RecipientBootstrap {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let nonce = recipient_random()?;
+        // A short OS temporary path avoids sockaddr_un truncation on macOS.
+        let directory = PathBuf::from("/tmp").join(format!("herdr-i-{}", &nonce[..24]));
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        match std::os::unix::net::UnixListener::bind(directory.join("control")) {
+            Ok(listener) => {
+                let bootstrap = Self {
+                    listener,
+                    directory,
+                    nonce,
+                };
+                bootstrap.listener.set_nonblocking(true)?;
+                Ok(bootstrap)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir(&directory);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn path(&self) -> PathBuf {
+        self.directory.join("control")
+    }
+
+    pub(crate) fn accept(
+        self,
+        expected_pid: u32,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<RecipientStream> {
+        use std::io::{BufRead, BufReader};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    // macOS accepted sockets inherit the listener nonblocking flag.
+                    stream.set_nonblocking(false)?;
+                    let (pid, uid) = super::recipient_peer(&stream)?;
+                    if !recipient_peer_matches(
+                        (pid, uid),
+                        (expected_pid, unsafe { libc::geteuid() }),
+                    ) {
+                        continue;
+                    }
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+                    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+                    // No buffered read-ahead: the next byte belongs to the control protocol.
+                    let mut reader = BufReader::with_capacity(1, &stream);
+                    let mut nonce = String::new();
+                    std::io::Read::take(&mut reader, 66).read_line(&mut nonce)?;
+                    if nonce != format!("{}\n", self.nonce) {
+                        continue;
+                    }
+                    stream.set_read_timeout(None)?;
+                    return Ok(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for RecipientBootstrap {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.path());
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+pub(crate) fn connect_recipient(path: &Path) -> std::io::Result<RecipientStream> {
+    let stream = RecipientStream::connect(path)?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    Ok(stream)
+}
+
+pub(crate) struct RecipientProviderInput(pub(crate) std::process::ChildStdin);
+impl std::io::Write for RecipientProviderInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let fd = self.0.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match self.0.write(&bytes[offset..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => offset += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(offset)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn recipient_test_pair() -> std::io::Result<(RecipientStream, RecipientStream)> {
+    RecipientStream::pair()
+}
+
+#[cfg(test)]
+mod recipient_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn recipient_bootstrap_process_fixture() {
+        let Some(path) = std::env::var_os("HERDR_TEST_RECIPIENT_PATH") else {
+            return;
+        };
+        let mut stream = RecipientStream::connect(path).unwrap();
+        let _ = writeln!(
+            stream,
+            "{}",
+            std::env::var("HERDR_TEST_RECIPIENT_NONCE").unwrap()
+        );
+        assert_eq!(stream.read(&mut [0u8; 1]).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn recipient_bootstrap_checks_native_pid_nonce_and_unlinks_once() {
+        let bootstrap = RecipientBootstrap::new().unwrap();
+        let path = bootstrap.path();
+        let nonce = bootstrap.nonce.clone();
+        assert_eq!(
+            std::fs::metadata(&bootstrap.directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let directory = bootstrap.directory.clone();
+        let accepted = std::thread::spawn(move || {
+            bootstrap
+                .accept(
+                    std::process::id(),
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .unwrap()
+        });
+        // Real different process, same effective UID and correct nonce: rejected.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::unix_common::recipient_tests::recipient_bootstrap_process_fixture",
+                "--nocapture",
+            ])
+            .env("HERDR_TEST_RECIPIENT_PATH", &path)
+            .env("HERDR_TEST_RECIPIENT_NONCE", &nonce)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Correct process and UID, incorrect nonce: rejected before binding.
+        let mut wrong = RecipientStream::connect(&path).unwrap();
+        writeln!(wrong, "wrong").unwrap();
+        assert_eq!(wrong.read(&mut [0u8; 1]).unwrap(), 0);
+        let mut valid = RecipientStream::connect(&path).unwrap();
+        writeln!(valid, "{nonce}").unwrap();
+        let mut bound = accepted.join().unwrap();
+        assert!(!path.exists());
+        assert!(!directory.exists());
+        assert!(RecipientStream::connect(&path).is_err());
+        valid.write_all(b"one generation").unwrap();
+        let mut bytes = [0; 14];
+        bound.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"one generation");
+    }
+}
+
+fn recipient_peer_matches(actual: (u32, u32), expected: (u32, u32)) -> bool {
+    actual == expected
+}
+#[cfg(test)]
+mod recipient_peer_tests {
+    #[test]
+    fn recipient_peer_requires_both_pid_and_uid() {
+        assert!(super::recipient_peer_matches((1, 2), (1, 2)));
+        assert!(!super::recipient_peer_matches((1, 3), (1, 2)));
+        assert!(!super::recipient_peer_matches((3, 2), (1, 2)));
+    }
+}
+
+pub(crate) fn configure_recipient_provider(
+    command: &mut std::process::Command,
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    Ok(())
+}
+
+/// Observe without reaping: retain ownership of the PID/group until cleanup.
+pub(crate) fn recipient_provider_exited(child: &std::process::Child) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.si_signo != 0)
+}
+
+pub(crate) fn terminate_recipient_provider(child: &mut std::process::Child) {
+    // The direct child has not been reaped, so its process-group identity cannot
+    // be recycled underneath this cleanup. Never target an inherited group.
+    let group = -(child.id() as libc::pid_t);
+    unsafe {
+        libc::kill(group, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !recipient_provider_exited(child).unwrap_or(true) && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}

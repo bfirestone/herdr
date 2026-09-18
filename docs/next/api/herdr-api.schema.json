@@ -1222,6 +1222,30 @@
     },
     "request": {
       "$defs": {
+        "AgentPromptExactParams": {
+          "additionalProperties": false,
+          "properties": {
+            "recipient_token": {
+              "type": "string"
+            },
+            "server_instance": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "server_instance",
+            "recipient_token",
+            "text"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1329,6 +1353,27 @@
           "required": [
             "target",
             "keys"
+          ],
+          "type": "object"
+        },
+        "AgentStartIntegratedParams": {
+          "additionalProperties": false,
+          "description": "Explicit integrated launch; never changes legacy agent.start semantics.",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "workspace_id",
+            "cwd"
           ],
           "type": "object"
         },
@@ -5438,6 +5483,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.start_integrated",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentStartIntegratedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt_exact",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptExactParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.start",
               "type": "string"
             },
@@ -6655,6 +6732,16 @@
                 "null"
               ]
             },
+            "exact_prompt": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ExactPromptRecipient"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "focused": {
               "type": "boolean"
             },
@@ -7557,6 +7644,58 @@
             "layout_updated"
           ],
           "type": "string"
+        },
+        "ExactPromptCapability": {
+          "properties": {
+            "guarantee": {
+              "type": "string"
+            },
+            "max_text_bytes": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "version",
+            "max_text_bytes",
+            "guarantee"
+          ],
+          "type": "object"
+        },
+        "ExactPromptRecipient": {
+          "properties": {
+            "ready": {
+              "type": "boolean"
+            },
+            "recipient_token": {
+              "type": "string"
+            },
+            "server_instance": {
+              "type": "string"
+            },
+            "transport": {
+              "type": "string"
+            },
+            "version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "version",
+            "recipient_token",
+            "server_instance",
+            "transport",
+            "ready"
+          ],
+          "type": "object"
         },
         "InstalledPluginInfo": {
           "properties": {
@@ -9236,6 +9375,76 @@
           "oneOf": [
             {
               "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "recipient_token": {
+                  "type": "string"
+                },
+                "server_instance": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_integrated_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "server_instance",
+                "recipient_token"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "acceptance": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "code": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "outcome": {
+                  "type": "string"
+                },
+                "recipient_token": {
+                  "type": "string"
+                },
+                "server_instance": {
+                  "type": "string"
+                },
+                "submission_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_prompt_exact_result",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "terminal_id",
+                "server_instance",
+                "recipient_token",
+                "outcome"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "capabilities": {
                   "anyOf": [
                     {
@@ -10589,6 +10798,16 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_prompt_exact": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/ExactPromptCapability"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

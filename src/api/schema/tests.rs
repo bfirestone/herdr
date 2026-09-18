@@ -721,6 +721,7 @@ fn success_response_round_trips() {
             version: "0.1.2".into(),
             protocol: 6,
             capabilities: Some(ServerCapabilities {
+                agent_prompt_exact: None,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(1),
@@ -1455,4 +1456,21 @@ fn pane_link_resolve_round_trips() {
         serde_json::from_value::<ResponseResult>(json).unwrap(),
         result
     );
+}
+
+#[test]
+fn integrated_exact_prompt_is_distinct_and_optional_capability_is_absent() {
+    let request: Request = serde_json::from_value(serde_json::json!({"id":"r1","method":"agent.prompt_exact","params":{"terminal_id":"t","server_instance":"s","recipient_token":"p","text":"hello\nworld"}})).unwrap();
+    assert!(matches!(request.method, Method::AgentPromptExact(_)));
+    assert_eq!(
+        serde_json::to_value(request).unwrap()["params"]["text"],
+        "hello\nworld"
+    );
+    let capabilities: ServerCapabilities =
+        serde_json::from_value(serde_json::json!({"live_handoff":false})).unwrap();
+    assert!(serde_json::to_value(capabilities)
+        .unwrap()
+        .get("agent_prompt_exact")
+        .is_none());
+    assert!(serde_json::from_value::<Request>(serde_json::json!({"id":"r1","method":"agent.prompt_exact","params":{"terminal_id":"t","server_instance":"s","recipient_token":"p","text":"hello","cwd":"/wrong"}})).is_err());
 }

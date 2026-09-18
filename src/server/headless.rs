@@ -2975,6 +2975,9 @@ impl HeadlessServer {
         let stream_active = msg.stream_active.clone();
 
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
+            for owner in self.app.integrated_owners.values() {
+                owner.revoke();
+            }
             let handoff_result = self.perform_live_handoff(params.clone());
             let handoff_succeeded = handoff_result.is_ok();
             let response = match handoff_result {
@@ -3086,6 +3089,14 @@ impl HeadlessServer {
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::AgentPromptExact(_)
+        ) {
+            self.app
+                .handle_exact_prompt_request(msg.request, msg.respond_to);
+            return true;
+        }
         if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
             let deferred_changed = self
                 .app

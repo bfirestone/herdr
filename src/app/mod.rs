@@ -102,6 +102,8 @@ impl AppPolicy {
 }
 
 pub struct App {
+    pub(crate) integrated_owners: HashMap<String, Arc<crate::integrated::Owner>>,
+    pub(crate) integrated_server_instance: Option<String>,
     pub state: AppState,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
@@ -577,6 +579,8 @@ impl App {
             direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
+            integrated_owners: HashMap::new(),
+            integrated_server_instance: crate::platform::recipient_random().ok(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

@@ -15,6 +15,8 @@ pub struct ServerLiveHandoffParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_prompt_exact: Option<ExactPromptCapability>,
     pub live_handoff: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,
@@ -27,4 +29,11 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExactPromptCapability {
+    pub version: u32,
+    pub max_text_bytes: u32,
+    pub guarantee: String,
 }

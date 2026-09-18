@@ -131,6 +131,10 @@ pub enum Method {
     AgentViewClear(AgentViewClearParams),
     #[serde(rename = "agent.focus")]
     AgentFocus(AgentTarget),
+    #[serde(rename = "agent.start_integrated")]
+    AgentStartIntegrated(AgentStartIntegratedParams),
+    #[serde(rename = "agent.prompt_exact")]
+    AgentPromptExact(AgentPromptExactParams),
     #[serde(rename = "agent.start")]
     AgentStart(AgentStartParams),
     #[serde(rename = "agent.prompt")]

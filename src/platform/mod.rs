@@ -679,3 +679,22 @@ mod tests {
         );
     }
 }
+
+#[cfg(unix)]
+pub(crate) use unix_common::{recipient_random, RecipientBootstrap, RecipientStream};
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(unix)]
+pub(crate) fn recipient_peer(_: &RecipientStream) -> std::io::Result<(u32, u32)> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+#[cfg(unix)]
+pub(crate) use unix_common::connect_recipient;
+#[cfg(all(test, unix))]
+pub(crate) use unix_common::recipient_test_pair;
+#[cfg(unix)]
+pub(crate) use unix_common::RecipientProviderInput;
+#[cfg(unix)]
+pub(crate) use unix_common::{
+    configure_recipient_provider, recipient_provider_exited, terminate_recipient_provider,
+};

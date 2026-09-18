@@ -893,6 +893,9 @@ impl App {
 
         let response = match request.method {
             Method::ServerStop(_) => {
+                for owner in self.integrated_owners.values() {
+                    owner.revoke();
+                }
                 self.state.should_quit = true;
                 SuccessResponse {
                     id: request.id,
@@ -1060,6 +1063,16 @@ impl App {
             Method::AgentViewSet(params) => return self.handle_agent_view_set(request.id, params),
             Method::AgentViewClear(params) => {
                 return self.handle_agent_view_clear(request.id, params);
+            }
+            Method::AgentStartIntegrated(params) => {
+                return self.handle_agent_start_integrated(request.id, params)
+            }
+            Method::AgentPromptExact(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "exact prompt requires asynchronous dispatch",
+                )
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentPrompt(_) => {

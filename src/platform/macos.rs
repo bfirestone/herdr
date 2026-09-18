@@ -26,6 +26,32 @@ pub(crate) use super::unix_common::{
 mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
+pub(crate) fn recipient_peer(
+    stream: &std::os::unix::net::UnixStream,
+) -> std::io::Result<(u32, u32)> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
+    let mut uid = 0;
+    let mut gid = 0;
+    // LOCAL_PEERPID complements getpeereid: a same-user impostor is insufficient.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut size,
+        )
+    } != 0
+        || unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0
+        || pid <= 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((pid as u32, uid))
+}
+
 #[cfg(test)]
 mod config_file_tests;
 

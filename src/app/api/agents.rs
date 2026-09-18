@@ -389,6 +389,105 @@ fn agent_not_found(id: String, target: &str) -> String {
     )
 }
 
+impl App {
+    pub(super) fn handle_agent_start_integrated(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentStartIntegratedParams,
+    ) -> String {
+        let result = self.start_integrated_codex(params);
+        match result {
+            Ok((agent, identity)) => encode_success(
+                id,
+                ResponseResult::AgentIntegratedStarted {
+                    agent,
+                    server_instance: identity.server_instance,
+                    recipient_token: identity.recipient_token,
+                },
+            ),
+            Err(error) => encode_error(id, "integrated_start_failed", error.to_string()),
+        }
+    }
+
+    pub(crate) fn handle_exact_prompt_request(
+        &mut self,
+        request: crate::api::schema::Request,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        let crate::api::schema::Method::AgentPromptExact(params) = request.method else {
+            return;
+        };
+        let identity = crate::integrated::RecipientIdentity {
+            terminal_id: params.terminal_id.clone(),
+            server_instance: params.server_instance.clone(),
+            recipient_token: params.recipient_token.clone(),
+        };
+        let owner = self.integrated_owners.get(&params.terminal_id).cloned();
+        // Runtime admission is bounded; all channel writes and reply waits are off-loop.
+        if let Some(owner) = owner {
+            if !self
+                .state
+                .terminals
+                .keys()
+                .any(|key| key.to_string() == params.terminal_id)
+            {
+                owner.revoke();
+            }
+            let admission = owner.reserve(&identity, &request.id, &params.text);
+            match admission {
+                Ok(receiver) => {
+                    std::thread::spawn(move || {
+                        owner.forward(&request.id, &params.text);
+                        let outcome = owner.wait(receiver);
+                        let _ = respond_to.send(exact_prompt_response(request.id, params, outcome));
+                    });
+                }
+                Err(outcome) => {
+                    let _ = respond_to.send(exact_prompt_response(request.id, params, outcome));
+                }
+            }
+        } else {
+            let _ = respond_to.send(exact_prompt_response(
+                request.id,
+                params,
+                crate::integrated::SubmissionOutcome::Rejected {
+                    code: "unsupported_recipient".into(),
+                },
+            ));
+        }
+    }
+}
+
+fn exact_prompt_response(
+    id: String,
+    params: crate::api::schema::AgentPromptExactParams,
+    result: crate::integrated::SubmissionOutcome,
+) -> String {
+    use crate::integrated::SubmissionOutcome;
+    let (outcome, acceptance, submission_id, code) = match result {
+        SubmissionOutcome::Accepted { submission_id } => (
+            "accepted",
+            Some("provider_input_accepted".into()),
+            Some(submission_id),
+            None,
+        ),
+        SubmissionOutcome::Rejected { code } => ("rejected", None, None, Some(code)),
+        SubmissionOutcome::Unknown => ("unknown", None, None, None),
+    };
+    encode_success(
+        id,
+        ResponseResult::AgentPromptExactResult {
+            terminal_id: params.terminal_id,
+            server_instance: params.server_instance,
+            recipient_token: params.recipient_token,
+            outcome: outcome.into(),
+            acceptance,
+            submission_id,
+            code,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

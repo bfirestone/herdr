@@ -50,6 +50,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentViewClear(_)
             | Method::AgentFocus(_)
             | Method::AgentStart(_)
+            | Method::AgentStartIntegrated(_)
+            | Method::AgentPromptExact(_)
             | Method::AgentPrompt(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)

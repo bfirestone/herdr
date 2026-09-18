@@ -4488,3 +4488,57 @@ mod tests {
         }
     }
 }
+
+// Integrated recipients require authenticated Unix peer PID/UID. Never fall back
+// to a pathname or loopback TCP identity on unsupported platforms.
+pub(crate) type RecipientStream = std::net::TcpStream;
+pub(crate) struct RecipientBootstrap {
+    pub(crate) nonce: String,
+}
+pub(crate) fn recipient_random() -> std::io::Result<String> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+impl RecipientBootstrap {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    pub(crate) fn path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::new()
+    }
+    pub(crate) fn accept(
+        self,
+        _: u32,
+        _: &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<RecipientStream> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+pub(crate) fn connect_recipient(_: &std::path::Path) -> std::io::Result<RecipientStream> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+pub(crate) struct RecipientProviderInput(pub(crate) std::process::ChildStdin);
+impl std::io::Write for RecipientProviderInput {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn recipient_test_pair() -> std::io::Result<(RecipientStream, RecipientStream)> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+pub(crate) fn configure_recipient_provider(_: &mut std::process::Command) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+pub(crate) fn recipient_provider_exited(_: &std::process::Child) -> std::io::Result<bool> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+pub(crate) fn terminate_recipient_provider(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}

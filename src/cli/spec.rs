@@ -405,16 +405,19 @@ fn agent_command() -> Command {
                 .override_usage(
                     "herdr agent start <NAME> --kind <KIND> --pane <ID> [OPTIONS] [-- [AGENT_ARG]...]",
                 )
-                .arg(required("name", "NAME"))
+                .arg(Arg::new("name").value_name("NAME").required_unless_present("integrated"))
+                .arg(option("integrated", "PROVIDER").value_parser(["codex"]).conflicts_with_all(["name", "kind", "pane", "agent_args"]).requires_all(["workspace", "cwd"]))
+                .arg(option("workspace", "WORKSPACE_ID").requires("integrated"))
+                .arg(option("cwd", "TRUSTED_ABSOLUTE_PATH").requires("integrated"))
                 .arg(
                     option("kind", "KIND")
-                        .required(true)
+                        .required_unless_present("integrated")
                         .value_parser(agent_kind_values())
                         .help("Supported agent kind and canonical executable"),
                 )
                 .arg(
                     option("pane", "ID")
-                        .required(true)
+                        .required_unless_present("integrated")
                         .help("Existing pane at an interactive shell prompt"),
                 )
                 .arg(
@@ -1289,6 +1292,48 @@ mod tests {
     }
 
     #[test]
+    fn integrated_start_is_explicit_and_legacy_start_keeps_its_requirements() {
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr",
+                "agent",
+                "start",
+                "--integrated",
+                "codex",
+                "--workspace",
+                "ws_1",
+                "--cwd",
+                "/tmp"
+            ])
+            .is_ok());
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr", "agent", "start", "worker", "--kind", "codex", "--pane", "p1"
+            ])
+            .is_ok());
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr", "agent", "start", "worker", "--kind", "codex", "--cwd", "/tmp"
+            ])
+            .is_err());
+        assert!(super::command()
+            .try_get_matches_from([
+                "herdr",
+                "agent",
+                "start",
+                "--integrated",
+                "codex",
+                "--pane",
+                "p1",
+                "--workspace",
+                "ws_1",
+                "--cwd",
+                "/tmp"
+            ])
+            .is_err());
+    }
+
+    #[test]
     fn spec_models_agent_start_target_and_trailing_args() {
         let cmd = super::command();
         let agent_start = command_path(&cmd, &["agent", "start"]);
@@ -1300,7 +1345,10 @@ mod tests {
                 .map(str::to_string)
         );
         assert!(has_option(agent_start, "pane"));
-        for legacy in ["cwd", "workspace", "tab", "split", "focus", "env", "argv"] {
+        assert!(has_option(agent_start, "integrated"));
+        assert!(has_option(agent_start, "workspace"));
+        assert!(has_option(agent_start, "cwd"));
+        for legacy in ["tab", "split", "focus", "env", "argv"] {
             assert!(!has_option(agent_start, legacy), "legacy option --{legacy}");
         }
         assert!(agent_start

@@ -42,6 +42,23 @@ pub struct ErrorBody {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    AgentIntegratedStarted {
+        agent: super::AgentInfo,
+        server_instance: String,
+        recipient_token: String,
+    },
+    AgentPromptExactResult {
+        terminal_id: String,
+        server_instance: String,
+        recipient_token: String,
+        outcome: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        acceptance: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        submission_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+    },
     Pong {
         version: String,
         protocol: u32,

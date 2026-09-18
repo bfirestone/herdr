@@ -26,6 +26,7 @@ mod events;
 mod ghostty;
 mod handoff_runtime;
 mod input;
+mod integrated;
 mod integration;
 mod ipc;
 mod kitty_graphics;
@@ -509,6 +510,9 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    if raw_args.get(1).map(String::as_str) == Some("integrated-agent-pane") {
+        return integrated::helper::run(&raw_args[2..]);
+    }
     if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
         return finish_cli(outcome);
     }
