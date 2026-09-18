@@ -601,6 +601,24 @@ def assert_isolated(record, control_identity):
         raise ProofFailure('provider_control_fd_inherited')
 
 
+def fixture_command_failure(result):
+    """Return bounded diagnostic categories, never provider output or paths."""
+    stderr = result.get('stderr')
+    stderr = stderr[:65536].lower() if isinstance(stderr, str) else ''
+    cause = 'unclassified'
+    if 'bwrap:' in stderr and 'namespace' in stderr:
+        cause = 'namespace_setup'
+    elif 'error while loading shared libraries:' in stderr and 'libpython' in stderr:
+        cause = 'python_shared_library_loader'
+    elif any(message in stderr for message in ('permission denied', 'exec format error', 'no such file or directory')):
+        cause = 'executable_or_permission'
+    detail = {'tool_failure_cause': cause}
+    exit_code = result.get('exitCode')
+    if type(exit_code) is int and -(2 ** 31) <= exit_code < 2 ** 31:
+        detail['tool_failure_exit_code'] = exit_code
+    return detail
+
+
 def provider_fixtures(args):
     validate_targets(args.session, args.scratch)
     process_parents()
@@ -634,6 +652,7 @@ def provider_fixtures(args):
                             'deltaBase64': base64.b64encode(b'pty-ok' if mode == 'pty' else b'child-only').decode(), 'closeStdin': mode == 'pipe'})
             result = client.response(request_id)
             if result['exitCode'] != 0:
+                report.update(fixture_command_failure(result))
                 raise ProofFailure('fixture_tool_failed_' + mode)
             output = client.output(process_id).split(b'READY\n', 1)[-1] if mode != 'null' else result['stdout']
             observation = json.loads(output)
@@ -813,6 +832,61 @@ class SafetyTests(unittest.TestCase):
                 self.assertEqual(len(providers), failing_instance + 1)
                 self.assertEqual(report['owned_cleanup'], 'UNVERIFIED')
                 self.assertTrue(root.is_dir())
+
+    def test_command_failure_details_classify_without_exposing_private_output(self):
+        private = 'private-provider-text-/private/path-secret-value'
+        cases = [
+            ('bwrap: No permissions to create new namespace', 'namespace_setup'),
+            ('bwrap: Creating new namespace failed: Operation not permitted', 'namespace_setup'),
+            ('python: error while loading shared libraries: libpython3.14.so.1.0: cannot open shared object file', 'python_shared_library_loader'),
+            ('exec: Permission denied', 'executable_or_permission'),
+            ('exec: Exec format error', 'executable_or_permission'),
+            (private, 'unclassified'),
+        ]
+        for stderr, expected in cases:
+            with self.subTest(cause=expected):
+                detail = fixture_command_failure({'exitCode': 127, 'stderr': stderr + private,
+                                                  'stdout': private})
+                self.assertEqual(detail, {'tool_failure_exit_code': 127, 'tool_failure_cause': expected})
+                self.assertNotIn(private, json.dumps(detail))
+
+    def test_command_failure_details_bound_exit_status_and_diagnostic_input(self):
+        for code in ('private-exit-value', True, None, 2 ** 31, -(2 ** 31) - 1):
+            with self.subTest(code=code):
+                detail = fixture_command_failure({'exitCode': code, 'stderr': {'private': 'value'}})
+                self.assertEqual(detail, {'tool_failure_cause': 'unclassified'})
+        for code in (-(2 ** 31), -9, 1, 2 ** 31 - 1):
+            self.assertEqual(fixture_command_failure({'exitCode': code})['tool_failure_exit_code'], code)
+        detail = fixture_command_failure({'exitCode': 1, 'stderr': 'x' * 65536 + 'bwrap: No permissions to create new namespace'})
+        self.assertEqual(detail['tool_failure_cause'], 'unclassified')
+
+    def test_failed_descriptor_command_reports_only_categories_and_preserves_failure(self):
+        private = 'private-provider-stdout-stderr-path-marker'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / ('herdr-codex-' + 'd' * 32)
+            args = argparse.Namespace(session='codex-proof-' + 'd' * 32, scratch=root,
+                                      provider_path=Path('/unused'))
+            provider = mock.Mock()
+            provider.response.return_value = {'exitCode': 1, 'stdout': private, 'stderr': private}
+            def start(*args, **kwargs):
+                kwargs['owners'].append(provider)
+                return provider
+            output = io.StringIO()
+            with mock.patch(__name__ + '.validate_provider', return_value='/unused'), mock.patch(
+                    __name__ + '.process_parents', return_value={}), mock.patch(
+                    __name__ + '.DirectProvider', side_effect=start), redirect_stdout(output):
+                result = provider_fixtures(args)
+            report = json.loads(output.getvalue())
+            self.assertEqual(result, 1)
+            self.assertEqual(report['diagnostic'], 'fixture_tool_failed_null')
+            self.assertEqual(report['tool_failure_exit_code'], 1)
+            self.assertEqual(report['tool_failure_cause'], 'unclassified')
+            self.assertEqual(report['qualification'], 'UNVERIFIED')
+            self.assertEqual(report['tool_fd_isolation'], 'UNVERIFIED')
+            self.assertEqual(report['owned_cleanup'], 'PASS')
+            self.assertNotIn(private, output.getvalue())
+            self.assertFalse(root.exists())
+            provider.close.assert_called_once()
 
     def test_process_inspection_denial_is_redacted(self):
         with mock.patch('subprocess.run', side_effect=PermissionError('private diagnostic sentinel')):
