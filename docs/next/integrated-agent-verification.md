@@ -85,7 +85,15 @@ match that control identity.
   `core/src/session/turn.rs:287–289` returns before sampling when that hook stops.
 - Initialization failure and normal shutdown close/reap the owned provider. The
   harness checks its observed descendant tree independently of successful receipt
-  parsing. No user's process is terminated.
+  parsing. Cleanup failures remain sticky across repeated close calls and every
+  intermediate provider instance; unverified cleanup retains scratch diagnostics.
+  No user's process is terminated.
+
+Process inspection is checked before launching a provider or creating scratch.
+If inspection becomes unavailable later, the harness still closes and reaps its
+directly owned processes, returns a redacted UNVERIFIED cleanup result, and keeps
+diagnostic scratch. Live sessions retain previously observed descendants across
+API calls so shutdown cannot forget an already observed, reparented child.
 
 Local macOS results: native and normal npm wrapper passed null/private-pipe/PTY,
 hook and MCP checks. Both recorded owned cleanup PASS and a matching stopped

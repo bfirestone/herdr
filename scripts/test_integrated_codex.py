@@ -22,6 +22,8 @@ import subprocess
 import tempfile
 import time
 import unittest
+import io
+from contextlib import redirect_stdout
 from unittest import mock
 
 VERSION = 'codex-cli 0.154.0'
@@ -99,8 +101,50 @@ def descendants(root, parents):
 
 
 def process_parents():
-    result = subprocess.run(['ps', '-axo', 'pid=,ppid='], capture_output=True, check=True, timeout=5)
-    return {int(pid): int(parent) for pid, parent in (line.split() for line in result.stdout.splitlines())}
+    try:
+        result = subprocess.run(['ps', '-axo', 'pid=,ppid='], capture_output=True, check=True, timeout=5)
+        return {int(pid): int(parent) for pid, parent in (line.split() for line in result.stdout.splitlines())}
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ProofFailure('process_inspection_unavailable') from error
+
+
+def observe_owned(owner, pid):
+    try:
+        owner.owned_children |= descendants(pid, process_parents())
+    except ProofFailure as error:
+        owner.cleanup_failure = owner.cleanup_failure or error
+        raise
+
+
+def cleanup_step(errors, action):
+    # Failure of observation must not skip closure/reaping of known owned handles.
+    try:
+        action()
+    except ProofFailure as error:
+        errors.append(error)
+    except (OSError, subprocess.SubprocessError):
+        errors.append(ProofFailure('owned_cleanup_unverified'))
+
+
+def reap_owned(child, graceful=False):
+    if graceful:
+        try:
+            child.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        child.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+        child.wait(timeout=3)
 
 
 def consent_request(preview, thread, turn, command, cwd):
@@ -140,8 +184,13 @@ class Session:
         self.server = None
         self.client = None
         self.client_pty = None
+        self.owned_children = set()
+        self.closed = False
+        self.cleanup_failure = None
 
     def api(self, method, params=None):
+        if self.server is not None:
+            observe_owned(self, self.server.pid)
         self.sequence += 1
         request = {'id': 'qualification-' + str(self.sequence), 'method': method, 'params': params or {}}
         response = subprocess.run(self.command + ['remote-api-bridge'],
@@ -258,34 +307,35 @@ class Session:
             raise ProofFailure('denied_scratch_changed')
 
     def close(self):
-        owned = descendants(self.server.pid, process_parents()) if self.server is not None else set()
-        if self.client is not None and self.client.poll() is None:
-            self.client.terminate()
-            try:
-                self.client.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.client.kill()
-                self.client.wait(timeout=3)
-        if self.client_pty is not None:
-            os.close(self.client_pty)
-        if self.server is None:
+        if self.closed:
+            if self.cleanup_failure is not None:
+                raise self.cleanup_failure
             return
-        if self.server.poll() is None:
+        self.closed = True
+        errors = [self.cleanup_failure] if self.cleanup_failure is not None else []
+        if self.server is not None:
+            cleanup_step(errors, lambda: observe_owned(self, self.server.pid))
+        if self.client is not None and self.client.poll() is None:
+            cleanup_step(errors, lambda: reap_owned(self.client))
+        if self.client_pty is not None:
+            cleanup_step(errors, lambda: os.close(self.client_pty))
+        if self.server is not None and self.server.poll() is None:
             try:
                 stopped = subprocess.run(self.command + ['server', 'stop'], env=self.env, cwd=self.workspace,
                                          capture_output=True, timeout=10)
                 if stopped.returncode:
                     raise ProofFailure('owned_stop_failed')
                 self.server.wait(timeout=10)
-            except (subprocess.TimeoutExpired, ProofFailure):
-                self.server.terminate()
-                try:
-                    self.server.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    self.server.kill()
-                    self.server.wait(timeout=3)
-                raise ProofFailure('owned_cleanup_fallback')
-        eventually(lambda: not (owned & process_parents().keys()), 'owned_descendant_cleanup_unverified', timeout=5)
+            except (OSError, subprocess.SubprocessError, ProofFailure):
+                errors.append(ProofFailure('owned_cleanup_fallback'))
+                cleanup_step(errors, lambda: reap_owned(self.server))
+        elif self.server is not None:
+            cleanup_step(errors, lambda: self.server.wait(timeout=3))
+        cleanup_step(errors, lambda: eventually(lambda: not (self.owned_children & process_parents().keys()),
+                                               'owned_descendant_cleanup_unverified', timeout=5))
+        self.cleanup_failure = errors[0] if errors else None
+        if self.cleanup_failure is not None:
+            raise self.cleanup_failure
 
 
 def live(args):
@@ -295,6 +345,7 @@ def live(args):
         if args.consent_scratch == args.scratch:
             raise ProofFailure('consent_target_must_be_distinct')
     binary = validate_binary(args.herdr_bin)
+    process_parents()  # Verify this prerequisite before any provider launch or target creation.
     provider = validate_provider(args.provider_path)
     args.scratch.mkdir(mode=0o700)
     if args.consent_scratch is not None:
@@ -346,7 +397,7 @@ def live(args):
             session.close()
             report['owned_cleanup'] = 'PASS'
         except ProofFailure as error:
-            report['owned_cleanup'] = 'FAIL'
+            report['owned_cleanup'] = 'UNVERIFIED'
             report['diagnostic'] = str(error)
         print(json.dumps(report, sort_keys=True))
         # Preserve only redacted evidence; provider logs can contain intended input.
@@ -418,13 +469,14 @@ def descriptor_environment(root):
 
 class DirectProvider:
     """Bounded observer for shipped-binary fixtures, never a product transport."""
-    def __init__(self, binary, root, overrides=()):
+    def __init__(self, binary, root, overrides=(), owners=None):
         self.buffer = b''
         self.responses = {}
         self.notifications = []
         self.stderr_bytes = 0
         self.owned_children = set()
         self.closed = False
+        self.cleanup_failure = None
         self.sequence = 0
         env = descriptor_environment(root)
         read_fd, write_fd = os.pipe()
@@ -443,6 +495,8 @@ class DirectProvider:
         finally:
             os.close(read_fd)
         self.input = os.fdopen(write_fd, 'wb', buffering=0)
+        if owners is not None:
+            owners.append(self)
         try:
             reply = self.call('initialize', {'clientInfo': {'name': 'herdr_descriptor_fixture', 'version': '1'},
                                              'capabilities': {'experimentalApi': True}})
@@ -468,7 +522,7 @@ class DirectProvider:
         return request_id
 
     def frame(self, deadline):
-        self.owned_children |= descendants(self.child.pid, process_parents())
+        observe_owned(self, self.child.pid)
         while b'\n' not in self.buffer:
             if time.monotonic() >= deadline:
                 raise ProofFailure('fixture_provider_deadline')
@@ -521,25 +575,24 @@ class DirectProvider:
 
     def close(self):
         if self.closed:
+            if self.cleanup_failure is not None:
+                raise self.cleanup_failure
             return
         self.closed = True
-        self.owned_children |= descendants(self.child.pid, process_parents())
+        errors = [self.cleanup_failure] if self.cleanup_failure is not None else []
+        cleanup_step(errors, lambda: observe_owned(self, self.child.pid))
         unexpected_exit = self.child.poll() is not None
-        self.input.close()
-        try:
-            self.child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.child.terminate()
-            try:
-                self.child.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.child.kill()
-                self.child.wait(timeout=3)
-        self.child.stdout.close()
-        self.child.stderr.close()
-        eventually(lambda: not (self.owned_children & process_parents().keys()), 'fixture_owned_tree_cleanup', timeout=5)
+        cleanup_step(errors, self.input.close)
+        cleanup_step(errors, lambda: reap_owned(self.child, graceful=True))
+        cleanup_step(errors, self.child.stdout.close)
+        cleanup_step(errors, self.child.stderr.close)
+        cleanup_step(errors, lambda: eventually(lambda: not (self.owned_children & process_parents().keys()),
+                                               'fixture_owned_tree_cleanup', timeout=5))
         if unexpected_exit:
-            raise ProofFailure('fixture_unexpected_exit_cleanup_unverified')
+            errors.append(ProofFailure('fixture_unexpected_exit_cleanup_unverified'))
+        self.cleanup_failure = errors[0] if errors else None
+        if self.cleanup_failure is not None:
+            raise self.cleanup_failure
 
 
 def assert_isolated(record, control_identity):
@@ -550,6 +603,7 @@ def assert_isolated(record, control_identity):
 
 def provider_fixtures(args):
     validate_targets(args.session, args.scratch)
+    process_parents()
     provider = validate_provider(args.provider_path)
     args.scratch.mkdir(mode=0o700)
     root = args.scratch
@@ -560,9 +614,10 @@ def provider_fixtures(args):
               'qualification': 'UNVERIFIED', 'tool_fd_isolation': 'UNVERIFIED',
               'hook_fd_isolation': 'UNVERIFIED', 'mcp_fd_isolation': 'UNVERIFIED'}
     client = None
+    providers = []
     owned_children = set()
     try:
-        client = DirectProvider(provider, root)
+        client = DirectProvider(provider, root, owners=providers)
         for mode in ('null', 'pipe', 'pty'):
             params = {'command': [python, str(script), mode, '-'], 'cwd': str(root), 'timeoutMs': 10000}
             process_id = 'owned-' + mode
@@ -597,7 +652,7 @@ def provider_fixtures(args):
             'mcp_servers.herdr_descriptor={command=' + json.dumps(python) + ',args=' +
             json.dumps([str(script), 'mcp', str(mcp_receipt)]) + ',startup_timeout_sec=10}',
         ]
-        client = DirectProvider(provider, root, overrides)
+        client = DirectProvider(provider, root, overrides, owners=providers)
         listed = client.call('hooks/list', {'cwds': [str(root)]})
         hooks = [hook for entry in listed['data'] for hook in entry['hooks']
                  if hook.get('command') == hook_command and hook.get('eventName') == 'sessionStart']
@@ -608,7 +663,7 @@ def provider_fixtures(args):
         # CLI layer: no config-write RPC, user hook changes, or blanket bypass.
         overrides.append('hooks.state={' + json.dumps(hook['key']) + '={trusted_hash=' + json.dumps(hook['currentHash']) + '}}')
         client.close()
-        client = DirectProvider(provider, root, overrides)
+        client = DirectProvider(provider, root, overrides, owners=providers)
         verified = client.call('hooks/list', {'cwds': [str(root)]})
         matches = [h for entry in verified['data'] for h in entry['hooks'] if h['key'] == hook['key']]
         if len(matches) != 1 or matches[0]['trustStatus'] != 'trusted' or matches[0]['currentHash'] != hook['currentHash']:
@@ -646,20 +701,204 @@ def provider_fixtures(args):
     except (ProofFailure, subprocess.TimeoutExpired) as error:
         report['diagnostic'] = str(error) if isinstance(error, ProofFailure) else 'fixture_timeout'
     finally:
-        try:
-            if client is not None:
-                client.close()
-            eventually(lambda: not (owned_children & process_parents().keys()), 'fixture_owned_child_cleanup', timeout=5)
+        errors = []
+        for provider in providers:
+            cleanup_step(errors, provider.close)
+        cleanup_step(errors, lambda: eventually(lambda: not (owned_children & process_parents().keys()),
+                                               'fixture_owned_child_cleanup', timeout=5))
+        if not errors:
             report['owned_cleanup'] = 'PASS'
             shutil.rmtree(root)
-        except ProofFailure as error:
+        else:
             report['owned_cleanup'] = 'UNVERIFIED'
-            report['diagnostic'] = str(error)
+            report['diagnostic'] = str(errors[0])
         print(json.dumps(report, sort_keys=True))
     return 0 if all(report[key].startswith('PASS') for key in ('tool_fd_isolation', 'hook_fd_isolation', 'mcp_fd_isolation', 'owned_cleanup')) else 1
 
 
 class SafetyTests(unittest.TestCase):
+    def closing_provider(self, provider_type=DirectProvider):
+        provider = object.__new__(provider_type)
+        provider.closed = False
+        provider.cleanup_failure = None
+        provider.owned_children = {222}
+        provider.input = mock.Mock()
+        provider.child = mock.Mock(pid=111)
+        provider.child.poll.return_value = None
+        return provider
+
+    def test_failed_close_stays_failed_and_closes_resources_once(self):
+        provider = self.closing_provider()
+        with mock.patch(__name__ + '.process_parents', return_value={222: 1}), mock.patch(
+                __name__ + '.eventually', side_effect=ProofFailure('fixture_owned_tree_cleanup')):
+            for _ in range(2):
+                with self.assertRaisesRegex(ProofFailure, '^fixture_owned_tree_cleanup$'):
+                    provider.close()
+        provider.input.close.assert_called_once()
+        provider.child.wait.assert_called_once()
+        provider.child.stdout.close.assert_called_once()
+        provider.child.stderr.close.assert_called_once()
+
+    def test_unexpected_exit_cleanup_failure_is_sticky(self):
+        provider = self.closing_provider()
+        provider.child.poll.return_value = 1
+        with mock.patch(__name__ + '.process_parents', return_value={}):
+            for _ in range(2):
+                with self.assertRaisesRegex(ProofFailure, '^fixture_unexpected_exit_cleanup_unverified$'):
+                    provider.close()
+
+    def test_failed_initialization_keeps_owner_and_failed_cleanup_result(self):
+        owners = []
+        child = mock.Mock(pid=111)
+        child.poll.return_value = None
+        with tempfile.TemporaryDirectory() as temporary, mock.patch('subprocess.Popen', return_value=child), mock.patch(
+                __name__ + '.DirectProvider.call', side_effect=ProofFailure('fixture_initialize_failure')), mock.patch(
+                __name__ + '.process_parents', side_effect=ProofFailure('process_inspection_unavailable')):
+            with self.assertRaisesRegex(ProofFailure, '^process_inspection_unavailable$'):
+                DirectProvider('/unused', Path(temporary), owners=owners)
+            self.assertEqual(len(owners), 1)
+            with self.assertRaisesRegex(ProofFailure, '^process_inspection_unavailable$'):
+                owners[0].close()
+        self.assertTrue(owners[0].input.closed)
+        child.wait.assert_called_once()
+        child.stdout.close.assert_called_once()
+
+    def test_intermediate_cleanup_failures_retain_scratch_and_never_report_pass(self):
+        for failing_instance in (0, 1):
+            with self.subTest(instance=failing_instance), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve() / ('herdr-codex-' + 'b' * 32)
+                args = argparse.Namespace(session='codex-proof-' + 'b' * 32, scratch=root,
+                                          provider_path=Path('/unused'))
+                providers = []
+                def start(*args, **kwargs):
+                    provider = self.closing_provider()
+                    provider.control_identity = [7, 8, 9]
+                    index = len(providers)
+                    providers.append(provider)
+                    if kwargs.get('owners') is not None:
+                        kwargs['owners'].append(provider)
+                    def call(method, params):
+                        if method == 'hooks/list':
+                            return {'data': [{'hooks': [{'command': shlex.join([
+                                str(Path(os.sys.executable).resolve()), str(root / 'descriptor_child.py'),
+                                'hook', str(root / 'hook-descriptors.json')]), 'eventName': 'sessionStart',
+                                'key': 'owned-key', 'currentHash': 'owned-hash'}]}]}
+                        return {}
+                    def request(method, params):
+                        provider.mode = params.get('tty', False)
+                        provider.null = not params.get('streamStdin', False) and not provider.mode
+                        return 'owned-request'
+                    provider.call = call
+                    provider.request = request
+                    provider.output = lambda process: b'READY\n' + json.dumps({
+                        'fds': [[0, 1, 2, 3]], 'input': 'pty-ok' if provider.mode else 'child-only'}).encode()
+                    provider.response = lambda request: {'exitCode': 0, 'stdout': json.dumps({
+                        'fds': [[0, 1, 2, 3]], 'input': ''})}
+                    real_close = provider.close
+                    def close():
+                        if index == failing_instance:
+                            with mock.patch(__name__ + '.eventually', side_effect=ProofFailure('fixture_owned_tree_cleanup')):
+                                real_close()
+                        else:
+                            real_close()
+                    provider.close = close
+                    return provider
+                output = io.StringIO()
+                with mock.patch(__name__ + '.validate_provider', return_value='/unused'), mock.patch(
+                        __name__ + '.process_parents', return_value={}), mock.patch(
+                        __name__ + '.DirectProvider', side_effect=start), redirect_stdout(output):
+                    result = provider_fixtures(args)
+                report = json.loads(output.getvalue())
+                self.assertEqual(result, 1)
+                self.assertEqual(len(providers), failing_instance + 1)
+                self.assertEqual(report['owned_cleanup'], 'UNVERIFIED')
+                self.assertTrue(root.is_dir())
+
+    def test_process_inspection_denial_is_redacted(self):
+        with mock.patch('subprocess.run', side_effect=PermissionError('private diagnostic sentinel')):
+            with self.assertRaisesRegex(ProofFailure, '^process_inspection_unavailable$'):
+                process_parents()
+
+    def test_inspection_preflight_launches_nothing_and_returns_structured_result(self):
+        for descriptor in (False, True):
+            with self.subTest(descriptor=descriptor), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve() / ('herdr-codex-' + 'c' * 32)
+                argv = ['proof', '--session', 'codex-proof-' + 'c' * 32, '--scratch', str(root),
+                        '--provider-path', '/unused/provider', '--herdr-bin', '/unused/herdr']
+                if descriptor:
+                    argv.append('--provider-fixtures-only')
+                output = io.StringIO()
+                with mock.patch.object(os.sys, 'argv', argv), mock.patch(__name__ + '.validate_binary', return_value='/unused'), mock.patch(
+                        'subprocess.run', side_effect=PermissionError('private diagnostic sentinel')) as run, mock.patch(
+                        'subprocess.Popen') as spawn, redirect_stdout(output):
+                    self.assertEqual(main(), 1)
+                report = json.loads(output.getvalue())
+                self.assertEqual(report['diagnostic'], 'process_inspection_unavailable')
+                self.assertEqual(report['qualification'], 'UNVERIFIED')
+                self.assertEqual(report['owned_cleanup'], 'UNVERIFIED')
+                self.assertFalse(root.exists())
+                spawn.assert_not_called()
+                self.assertEqual(run.call_args.args[0][0], 'ps')
+
+    def test_provider_cleanup_reaps_known_process_when_inspection_is_denied(self):
+        provider = self.closing_provider()
+        with mock.patch('subprocess.run', side_effect=PermissionError('private diagnostic sentinel')):
+            for _ in range(2):
+                with self.assertRaisesRegex(ProofFailure, '^process_inspection_unavailable$'):
+                    provider.close()
+        provider.input.close.assert_called_once()
+        provider.child.wait.assert_called_once()
+        provider.child.stdout.close.assert_called_once()
+
+    def test_live_cleanup_reaps_known_processes_when_inspection_is_denied(self):
+        session = object.__new__(Session)
+        session.server = mock.Mock(pid=111)
+        session.server.poll.return_value = None
+        session.client = mock.Mock()
+        session.client.poll.return_value = None
+        session.client_pty = None
+        session.owned_children = {222}
+        session.closed = False
+        session.cleanup_failure = None
+        session.command = ['/unused', '--session', 'owned']
+        session.env = {}
+        session.workspace = Path('/tmp')
+        with mock.patch('subprocess.run', side_effect=PermissionError('private diagnostic sentinel')):
+            with self.assertRaisesRegex(ProofFailure, '^process_inspection_unavailable$'):
+                session.close()
+        session.client.terminate.assert_called_once()
+        session.client.wait.assert_called_once()
+        session.server.terminate.assert_called_once()
+        session.server.wait.assert_called_once()
+
+    def test_live_cleanup_keeps_previously_observed_reparented_children(self):
+        session = object.__new__(Session)
+        session.server = mock.Mock(pid=111)
+        session.server.poll.return_value = 0
+        session.client = None
+        session.client_pty = None
+        session.closed = False
+        session.cleanup_failure = None
+        session.owned_children = set()
+        session.sequence = 0
+        session.command = ['/unused']
+        session.env = {}
+        session.workspace = Path('/tmp')
+        response = mock.Mock(returncode=0, stdout=b'{"id":"qualification-1","result":{}}')
+        with mock.patch(__name__ + '.process_parents', return_value={222: 111}), mock.patch(
+                'subprocess.run', return_value=response):
+            session.api('ping')
+        def verify_once(check, category, timeout):
+            if not check():
+                raise ProofFailure(category)
+        with mock.patch(__name__ + '.process_parents', return_value={222: 1}), mock.patch(
+                __name__ + '.eventually', side_effect=verify_once):
+            for _ in range(2):
+                with self.assertRaisesRegex(ProofFailure, '^owned_descendant_cleanup_unverified$'):
+                    session.close()
+        session.server.wait.assert_called_once()
+        session.server.terminate.assert_not_called()
+
     def test_targets_reject_existing_relative_mismatched_and_symlink_paths(self):
         nonce = 'a' * 32
         session = 'codex-proof-' + nonce
@@ -784,7 +1023,8 @@ def main():
     try:
         return provider_fixtures(args) if args.provider_fixtures_only else live(args)
     except (ProofFailure, subprocess.TimeoutExpired) as error:
-        print(json.dumps({'qualification': 'UNVERIFIED', 'diagnostic': str(error) if isinstance(error, ProofFailure) else 'subprocess_timeout'}))
+        print(json.dumps({'qualification': 'UNVERIFIED', 'owned_cleanup': 'UNVERIFIED',
+                          'diagnostic': str(error) if isinstance(error, ProofFailure) else 'subprocess_timeout'}))
         return 1
 
 
