@@ -1155,6 +1155,28 @@ fn process_session_id(pid: u32) -> Option<i32> {
     fields.get(3)?.parse().ok()
 }
 
+pub(crate) fn recipient_peer(
+    stream: &std::os::unix::net::UnixStream,
+) -> std::io::Result<(u32, u32)> {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of_val(&cred) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut size,
+        )
+    } != 0
+        || cred.pid <= 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((cred.pid as u32, cred.uid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2165,26 +2187,4 @@ mod tests {
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
     }
-}
-
-pub(crate) fn recipient_peer(
-    stream: &std::os::unix::net::UnixStream,
-) -> std::io::Result<(u32, u32)> {
-    use std::os::fd::AsRawFd;
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut size = std::mem::size_of_val(&cred) as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut size,
-        )
-    } != 0
-        || cred.pid <= 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((cred.pid as u32, cred.uid))
 }
