@@ -7,7 +7,6 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +22,8 @@ use support::{
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    identity: Option<support::TestProcessIdentity>,
+    config_home: PathBuf,
 }
 
 struct RequestError {
@@ -32,9 +33,73 @@ struct RequestError {
 
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
-        let pid = self.child.process_id();
-        let _ = self.child.kill();
-        unregister_spawned_herdr_pid(pid);
+        let Some(identity) = &self.identity else {
+            // Armed immediately after spawn, before inspection or registration.
+            // A failed inspection never authorizes a signal; an unreaped live
+            // direct Child still owns its PID during this startup-only fallback.
+            let cleanup = (|| -> std::io::Result<()> {
+                for (signal, grace) in [
+                    (libc::SIGTERM, Duration::from_millis(400)),
+                    (libc::SIGKILL, Duration::from_secs(2)),
+                ] {
+                    if self.child.try_wait()?.is_some() {
+                        return Ok(());
+                    }
+                    let pid = self
+                        .child
+                        .process_id()
+                        .filter(|pid| *pid > 0 && *pid <= i32::MAX as u32)
+                        .ok_or_else(|| {
+                            std::io::Error::other("missing positive startup child PID")
+                        })?;
+                    if unsafe { libc::kill(pid as i32, signal) } != 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(error);
+                        }
+                    }
+                    let end = Instant::now() + grace;
+                    while Instant::now() < end {
+                        if self.child.try_wait()?.is_some() {
+                            return Ok(());
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                Err(std::io::Error::other(
+                    "startup child survived bounded TERM/KILL/reap",
+                ))
+            })();
+            if let Err(error) = cleanup {
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    support::set_handoff_starting(&self.config_home, false);
+                    return;
+                }
+                let failure = format!(
+                    "startup child {:?} cleanup unresolved: {error}",
+                    self.child.process_id()
+                );
+                support::retain_handoff_startup_failure(&self.config_home, &failure);
+                if thread::panicking() {
+                    eprintln!("{failure}");
+                } else {
+                    panic!("{failure}");
+                }
+            } else {
+                support::set_handoff_starting(&self.config_home, false);
+            }
+            return;
+        };
+        let result =
+            support::terminate_test_process(identity, Instant::now() + Duration::from_millis(2400));
+        let _ = self.child.try_wait();
+        match result {
+            Ok(()) => unregister_spawned_herdr_pid(Some(identity.pid)),
+            Err(error) if thread::panicking() => {
+                eprintln!("direct child cleanup unresolved: {error}")
+            }
+            Err(error) => panic!("direct child cleanup unresolved: {error}"),
+        }
     }
 }
 
@@ -45,10 +110,53 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn unique_test_dir() -> PathBuf {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(format!("/tmp/hlh-{}-{n}", std::process::id()))
+fn unique_test_dir() -> support::HandoffFixture {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    loop {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("h{}-{n}", std::process::id()));
+        match support::HandoffFixture::create(base) {
+            Ok(fixture) => return fixture,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create exclusive fixture: {error}"),
+        }
+    }
+}
+
+fn spawn_owned_server(
+    config_home: &Path,
+    pair: portable_pty::PtyPair,
+    cmd: CommandBuilder,
+) -> SpawnedHerdr {
+    support::set_handoff_starting(config_home, true);
+    let child = match pair.slave.spawn_command(cmd) {
+        Ok(child) => child,
+        Err(error) => {
+            support::set_handoff_starting(config_home, false);
+            panic!("spawn fixture server: {error}");
+        }
+    };
+    let mut spawned = SpawnedHerdr {
+        _master: pair.master,
+        child,
+        identity: None,
+        config_home: config_home.to_path_buf(),
+    };
+    let pid = spawned.child.process_id().expect("server PID");
+    if std::env::var("HERDR_TEARDOWN_HELPER_MODE").as_deref() == Ok("panic-before-registration") {
+        let birth = support::test_process_birth(pid).unwrap().unwrap();
+        let report = std::env::var_os("HERDR_TEARDOWN_HELPER_REPORT").unwrap();
+        fs::write(
+            report,
+            serde_json::to_vec(&[serde_json::json!({"pid": pid, "birth": birth})]).unwrap(),
+        )
+        .unwrap();
+        panic!("injected failure while raw child startup is pending");
+    }
+    spawned.identity = Some(support::settled_herdr_identity(pid).unwrap().unwrap());
+    support::register_handoff_producer(config_home, spawned.identity.as_ref().unwrap());
+    register_spawned_herdr_pid(Some(pid));
+    spawned
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedHerdr {
@@ -91,12 +199,8 @@ fn spawn_server_with_env(
         cmd.env(key, value);
     }
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    SpawnedHerdr {
-        _master: pair.master,
-        child,
-    }
+    support::register_handoff_data_dir(config_home, None);
+    spawn_owned_server(config_home, pair, cmd)
 }
 
 fn spawn_named_session_server(
@@ -129,12 +233,8 @@ fn spawn_named_session_server(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    SpawnedHerdr {
-        _master: pair.master,
-        child,
-    }
+    support::register_handoff_data_dir(config_home, Some(session_name));
+    spawn_owned_server(config_home, pair, cmd)
 }
 
 fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> SpawnedHerdr {
@@ -164,12 +264,8 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    SpawnedHerdr {
-        _master: pair.master,
-        child,
-    }
+    support::register_handoff_data_dir(config_home, None);
+    spawn_owned_server(config_home, pair, cmd)
 }
 
 fn spawn_server_with_args_and_socket_env(
@@ -216,12 +312,8 @@ fn spawn_server_with_args_and_socket_env(
     }
     cmd.env("SHELL", "/bin/sh");
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
-    SpawnedHerdr {
-        _master: pair.master,
-        child,
-    }
+    support::register_handoff_data_dir(config_home, session_name);
+    spawn_owned_server(config_home, pair, cmd)
 }
 
 fn try_request(
@@ -232,6 +324,12 @@ fn try_request(
         retryable: true,
         message: format!("connect {}: {err}", socket_path.display()),
     })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
     let request_text = request.to_string();
     stream
         .write_all(request_text.as_bytes())
@@ -451,53 +549,19 @@ fn wait_for_server_ptmx_fd_count(pid: u32, expected: usize, timeout: Duration) {
     panic!("server pid {pid} had {last_count} ptmx master fds; expected {expected}");
 }
 
-#[cfg(target_os = "linux")]
 fn wait_for_replacement_server_pid(runtime_dir: &Path, old_pid: u32, timeout: Duration) -> u32 {
     let deadline = Instant::now() + timeout;
-    let mut last_pids = Vec::new();
     while Instant::now() < deadline {
-        last_pids = support::herdr_server_pids_for_runtime_dir(runtime_dir).unwrap_or_default();
-        if let Some(pid) = last_pids.iter().copied().find(|pid| *pid != old_pid) {
+        let pids =
+            support::handoff_replacement_pids(runtime_dir).expect("complete replacement inventory");
+        if let Some(pid) = pids.into_iter().find(|pid| *pid != old_pid) {
             return pid;
         }
         thread::sleep(Duration::from_millis(25));
     }
     panic!(
-        "replacement server for {} did not appear; last pids: {:?}",
-        runtime_dir.display(),
-        last_pids
-    );
-}
-
-#[cfg(target_os = "macos")]
-fn wait_for_replacement_server_pid(_runtime_dir: &Path, old_pid: u32, timeout: Duration) -> u32 {
-    let handoff_socket_pattern = format!("herdr-handoff-{old_pid}.sock");
-    let deadline = Instant::now() + timeout;
-    let mut last_stdout = String::new();
-    while Instant::now() < deadline {
-        if let Ok(output) = std::process::Command::new("pgrep")
-            .args(["-af", &handoff_socket_pattern])
-            .output()
-        {
-            last_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            for line in last_stdout.lines() {
-                let Some(pid_text) = line.split_whitespace().next() else {
-                    continue;
-                };
-                let Ok(pid) = pid_text.parse::<u32>() else {
-                    continue;
-                };
-                if pid != old_pid {
-                    return pid;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!(
-        "replacement server for {} did not appear; last pgrep output: {}",
-        _runtime_dir.display(),
-        last_stdout
+        "replacement server for {} did not appear",
+        runtime_dir.display()
     );
 }
 
@@ -2082,4 +2146,263 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 #[test]
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
+}
+
+#[test]
+fn teardown_normal_handoff_leaves_no_server() {
+    let _lock = test_lock();
+    for named in [false, true] {
+        let base = unique_test_dir();
+        let config = base.join("config");
+        let runtime = base.join("runtime");
+        let socket = if named {
+            config.join("herdr-dev/sessions/work/herdr.sock")
+        } else {
+            runtime.join("herdr.sock")
+        };
+        let server = if named {
+            spawn_named_session_server(&config, &runtime, "work")
+        } else {
+            spawn_server(&config, &runtime, &socket)
+        };
+        let original = server.identity.as_ref().unwrap().clone();
+        wait_for_socket(&socket, Duration::from_secs(10));
+        assert_ok(request(
+            &socket,
+            serde_json::json!({"id":"teardown:handoff","method":"server.live_handoff","params":{}}),
+        ));
+        let replacement =
+            wait_for_replacement_server_pid(&runtime, original.pid, Duration::from_secs(5));
+        let replacement = support::test_process_identity(replacement)
+            .unwrap()
+            .unwrap();
+        assert_ne!(original.pid, replacement.pid);
+        drop(server);
+        base.finish().unwrap();
+        for identity in [original, replacement] {
+            assert_ne!(
+                support::test_process_birth(identity.pid).unwrap(),
+                Some(identity.birth),
+                "server {} survived fixture cleanup",
+                identity.pid
+            );
+        }
+    }
+}
+
+// Dedicated child entry point: ordinary test discovery is a harmless no-op.
+#[test]
+fn teardown_helper_process() {
+    let Ok(mode) = std::env::var("HERDR_TEARDOWN_HELPER_MODE") else {
+        return;
+    };
+    let report = std::env::var_os("HERDR_TEARDOWN_HELPER_REPORT").unwrap();
+    if mode == "term-resistant" {
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        fs::write(report, "ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("TERM-resistant helper self-deadline reached without expected KILL");
+    }
+    assert!(matches!(
+        mode.as_str(),
+        "panic-after-handoff"
+            | "panic-before-readiness"
+            | "panic-before-response"
+            | "panic-before-registration"
+    ));
+    let base = unique_test_dir();
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    let socket = runtime.join("herdr.sock");
+    let server = spawn_server(&config, &runtime, &socket);
+    let original = server.identity.as_ref().unwrap().clone();
+    let mut identities = vec![serde_json::json!({"pid": original.pid, "birth": original.birth})];
+    fs::write(&report, serde_json::to_vec(&identities).unwrap()).unwrap();
+    if mode == "panic-before-readiness" {
+        panic!("injected failure before readiness assertion");
+    }
+    wait_for_socket(&socket, Duration::from_secs(10));
+    if mode == "panic-before-response" {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id":"teardown:handoff","method":"server.live_handoff","params":{}})
+        )
+        .unwrap();
+        // Deliberately leave the response unread, but synchronize on the import
+        // identity so the failure is not a timing-only sleep.
+    } else {
+        assert_ok(request(
+            &socket,
+            serde_json::json!({"id":"teardown:handoff","method":"server.live_handoff","params":{}}),
+        ));
+    }
+    let replacement =
+        wait_for_replacement_server_pid(&runtime, original.pid, Duration::from_secs(5));
+    let replacement = support::test_process_identity(replacement)
+        .unwrap()
+        .unwrap();
+    identities.push(serde_json::json!({"pid": replacement.pid, "birth": replacement.birth}));
+    fs::write(report, serde_json::to_vec(&identities).unwrap()).unwrap();
+    panic!("injected failure after replacement identity observed");
+}
+
+struct TeardownChild(std::process::Child);
+impl Drop for TeardownChild {
+    fn drop(&mut self) {
+        match self.0.try_wait() {
+            Ok(Some(_)) => return,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return,
+            Err(error) => {
+                eprintln!("nested child inspection unresolved: {error}");
+                return;
+            }
+            Ok(None) => {}
+        }
+        // No preceding reap: this direct child's handle still owns its PID.
+        let _ = self.0.kill();
+        let end = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < end {
+            match self.0.try_wait() {
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                _ => return,
+            }
+        }
+        eprintln!("nested child {} did not reap before deadline", self.0.id());
+    }
+}
+
+fn spawn_teardown_child(mode: &str, report: &Path) -> TeardownChild {
+    let child = TeardownChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["teardown_helper_process", "--exact", "--nocapture"])
+            .env("HERDR_TEARDOWN_HELPER_MODE", mode)
+            .env("HERDR_TEARDOWN_HELPER_REPORT", report)
+            .spawn()
+            .unwrap(),
+    );
+    support::record_teardown_helper(child.0.id());
+    child
+}
+
+#[test]
+fn teardown_panic_subprocesses_leave_no_server() {
+    let _lock = test_lock();
+    for mode in [
+        "panic-before-registration",
+        "panic-before-readiness",
+        "panic-after-handoff",
+        "panic-before-response",
+    ] {
+        let base = unique_test_dir();
+        let report = base.join("child-report.json");
+        let mut child = spawn_teardown_child(mode, &report);
+        let end = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < end, "nested {mode} exceeded deadline");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(101), "nested panic must be observed");
+        let records: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+        assert_eq!(
+            records.len(),
+            if matches!(mode, "panic-before-readiness" | "panic-before-registration") {
+                1
+            } else {
+                2
+            }
+        );
+        let mut leaked = Vec::new();
+        for record in records {
+            let pid = record["pid"].as_u64().unwrap() as u32;
+            let birth = (
+                record["birth"][0].as_u64().unwrap(),
+                record["birth"][1].as_u64().unwrap(),
+            );
+            // Kernel birth lookup is independent of replacement discovery.
+            if support::test_process_birth(pid).unwrap() == Some(birth) {
+                leaked.push(pid);
+                if let Some(identity) = support::test_process_identity(pid).unwrap() {
+                    if identity.birth == birth {
+                        support::terminate_test_process(
+                            &identity,
+                            Instant::now() + Duration::from_millis(2400),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "nested {mode} leaked owned servers {leaked:?}; emergency cleanup is a failed gate"
+        );
+    }
+}
+
+#[test]
+fn teardown_term_resistant_child_reaches_kill_and_is_reaped() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let report = base.join("ready");
+    let mut child = spawn_teardown_child("term-resistant", &report);
+    support::wait_for_file(&report, Duration::from_secs(5));
+    let identity = support::test_process_identity(child.0.id())
+        .unwrap()
+        .unwrap();
+    let started = Instant::now();
+    support::terminate_test_process(&identity, started + Duration::from_millis(2400)).unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "TERM should be ignored"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_ne!(
+        support::test_process_birth(identity.pid).unwrap(),
+        Some(identity.birth)
+    );
+    // The support helper reaps with waitpid; std Child may then report ECHILD.
+    match child.0.try_wait() {
+        Ok(Some(status)) => {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ECHILD)),
+        Ok(None) => panic!("controlled child still running"),
+    }
+}
+
+#[test]
+fn teardown_inspection_failure_retains_fixture_and_unwind_does_not_double_panic() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let path = base.to_path_buf();
+    base.inject_inspection_failure(true);
+    assert!(base.finish().unwrap_err().to_string().contains("injected"));
+    assert!(
+        path.exists(),
+        "unresolved cleanup must retain fixture files"
+    );
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _fixture = base;
+        panic!("injected unwind with unresolved inspection");
+    }));
+    assert!(failed.is_err());
+    assert!(path.exists());
+    support::clear_handoff_inspection_failure(&path);
+    cleanup_test_base(&path);
+    assert!(!path.exists());
 }

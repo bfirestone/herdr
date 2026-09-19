@@ -7,7 +7,8 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static PID_REGISTRY: OnceLock<Mutex<std::collections::HashMap<u32, TestProcessIdentity>>> =
+    OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
@@ -24,14 +25,746 @@ const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
+// A handoff fixture owns detached imports by exact executable, birth identity,
+// and registered data directory. PID reuse is rechecked before each signal;
+// this is not an atomic OS process-handle guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestProcessIdentity {
+    pub pid: u32,
+    pub birth: (u64, u64),
+    executable: PathBuf,
+    import_socket: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct HandoffOwnership {
+    base: PathBuf,
+    owner_birth: (u64, u64),
+    data_dirs: HashSet<PathBuf>,
+    producers: Vec<TestProcessIdentity>,
+    imports: Vec<TestProcessIdentity>,
+    finished: bool,
+    unresolved_startup: Option<String>,
+    starting: bool,
+    #[cfg(test)]
+    inspection_failure: bool,
+}
+
+type FixtureState = std::sync::Arc<Mutex<HandoffOwnership>>;
+static HANDOFF_FIXTURES: OnceLock<Mutex<std::collections::HashMap<PathBuf, FixtureState>>> =
+    OnceLock::new();
+
+fn fixture_registry(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, FixtureState>> {
+    HANDOFF_FIXTURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+pub struct HandoffFixture {
+    base: PathBuf,
+    state: FixtureState,
+}
+
+impl std::ops::Deref for HandoffFixture {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.base
+    }
+}
+
+impl AsRef<Path> for HandoffFixture {
+    fn as_ref(&self) -> &Path {
+        &self.base
+    }
+}
+
+impl HandoffFixture {
+    pub fn create(base: PathBuf) -> std::io::Result<Self> {
+        let owner_birth = test_process_birth(std::process::id())?
+            .ok_or_else(|| bad_inspection("missing test-owner birth identity"))?;
+        // Exclusive creation is essential: never adopt a stale fixture.
+        fs::create_dir(&base)?;
+        let state = std::sync::Arc::new(Mutex::new(HandoffOwnership {
+            base: base.clone(),
+            owner_birth,
+            ..Default::default()
+        }));
+        fixture_registry().insert(base.clone(), state.clone());
+        ensure_cleanup_hooks();
+        register_runtime_dir(&base.join("runtime"));
+        let fixture = Self { base, state };
+        register_fixture_data_dir(
+            &fixture.state,
+            &fixture.base,
+            &fixture.base.join("config/herdr-dev"),
+        )?;
+        register_fixture_data_dir(
+            &fixture.state,
+            &fixture.base,
+            &fixture.base.join("config/herdr"),
+        )?;
+        Ok(fixture)
+    }
+
+    #[cfg(test)]
+    pub fn inject_inspection_failure(&self, fail: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .inspection_failure = fail;
+    }
+
+    pub fn finish(&self) -> std::io::Result<()> {
+        finish_handoff_fixture(&self.state)
+    }
+}
+
+#[cfg(test)]
+pub fn clear_handoff_inspection_failure(base: &Path) {
+    let state = fixture_registry()
+        .get(base)
+        .cloned()
+        .expect("retained fixture ownership");
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .inspection_failure = false;
+}
+
+impl Drop for HandoffFixture {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            if std::thread::panicking() {
+                eprintln!(
+                    "handoff fixture {} cleanup unresolved: {error}",
+                    self.base.display()
+                );
+            } else {
+                panic!(
+                    "handoff fixture {} cleanup unresolved: {error}",
+                    self.base.display()
+                );
+            }
+        }
+    }
+}
+
+fn write_fixture_ledger(record: serde_json::Value) -> std::io::Result<()> {
+    if let Some(path) = std::env::var_os("HERDR_TEST_FIXTURE_LEDGER") {
+        // Serialize before appending; the supervisor treats incomplete records as errors.
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(format!("{record}\n").as_bytes())?;
+    }
+    Ok(())
+}
+
+fn register_fixture_data_dir(
+    state: &FixtureState,
+    base: &Path,
+    path: &Path,
+) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    let canonical = fs::canonicalize(path)?;
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .data_dirs
+        .extend([path.to_path_buf(), canonical]);
+    write_fixture_ledger(serde_json::json!({"base": base, "data_dir": path}))
+}
+
+pub fn register_handoff_data_dir(config_home: &Path, session: Option<&str>) {
+    let base = config_home.parent().expect("fixture config parent");
+    let state = fixture_registry()
+        .get(base)
+        .cloned()
+        .expect("pre-spawn fixture guard");
+    let mut path = config_home.join("herdr-dev");
+    if let Some(name) = session {
+        path = path.join("sessions").join(name);
+    }
+    register_fixture_data_dir(&state, base, &path).expect("register handoff data directory");
+}
+
+pub fn record_teardown_helper(pid: u32) {
+    let identity = test_process_identity(pid)
+        .expect("inspect helper child")
+        .expect("live helper child");
+    write_fixture_ledger(serde_json::json!({"pid": pid, "birth": identity.birth, "executable": identity.executable, "kind": "helper"})).expect("record helper child");
+}
+
+pub fn set_handoff_starting(config_home: &Path, starting: bool) {
+    let state = fixture_registry()
+        .get(config_home.parent().unwrap())
+        .cloned()
+        .expect("pre-spawn fixture guard");
+    state.lock().unwrap_or_else(|e| e.into_inner()).starting = starting;
+}
+
+pub fn retain_handoff_startup_failure(config_home: &Path, failure: &str) {
+    let state = fixture_registry()
+        .get(config_home.parent().unwrap())
+        .cloned();
+    if let Some(state) = state {
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unresolved_startup = Some(failure.to_owned());
+    }
+}
+
+pub fn register_handoff_producer(config_home: &Path, identity: &TestProcessIdentity) {
+    let state = fixture_registry()
+        .get(config_home.parent().unwrap())
+        .cloned()
+        .expect("pre-spawn fixture guard");
+    let pid = identity.pid;
+    {
+        let mut ownership = state.lock().unwrap_or_else(|e| e.into_inner());
+        ownership.producers.push(identity.clone());
+        ownership.starting = false;
+    }
+    write_fixture_ledger(
+        serde_json::json!({"pid": pid, "birth": [identity.birth.0, identity.birth.1], "executable": identity.executable}),
+    )
+    .expect("record direct child identity");
+}
+
+fn bad_inspection(message: &str) -> std::io::Error {
+    std::io::Error::other(message)
+}
+
+#[cfg(target_os = "macos")]
+pub fn test_process_birth(pid: u32) -> std::io::Result<Option<(u64, u64)>> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(bad_inspection("invalid PID"));
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let count = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut _,
+            size,
+        )
+    };
+    if count == size {
+        // Zombies have exited; waitpid in the bounded reap path consumes children.
+        return Ok((info.pbi_status != 5).then_some((info.pbi_start_tvsec, info.pbi_start_tvusec)));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn test_process_birth(pid: u32) -> std::io::Result<Option<(u64, u64)>> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(bad_inspection("invalid PID"));
+    }
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .ok_or_else(|| bad_inspection("invalid proc stat"))?
+        .1
+        .split_whitespace()
+        .collect();
+    if fields.first() == Some(&"Z") {
+        return Ok(None);
+    }
+    let start = fields
+        .get(19)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| bad_inspection("missing process start time"))?;
+    Ok(Some((start, 0)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn test_process_birth(_pid: u32) -> std::io::Result<Option<(u64, u64)>> {
+    Err(bad_inspection("process identity unsupported on this OS"))
+}
+
+#[cfg(target_os = "macos")]
+fn retry_macos_inspection<T>(
+    pid: u32,
+    operation: &str,
+    mut inspect: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut failure = match inspect() {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    if !matches!(
+        failure.raw_os_error(),
+        Some(libc::EINVAL | libc::EIO | libc::ESRCH)
+    ) {
+        return Err(failure);
+    }
+    let Some(birth) = test_process_birth(pid)? else {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    };
+    // These native reads can race exit or metadata changes. Only confirmed exit
+    // or changed birth means absence; persistent live uncertainty is an error.
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(10));
+        if test_process_birth(pid)? != Some(birth) {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        match inspect() {
+            Ok(value) => return Ok(value),
+            Err(error) => failure = error,
+        }
+        if !matches!(
+            failure.raw_os_error(),
+            Some(libc::EINVAL | libc::EIO | libc::ESRCH)
+        ) {
+            break;
+        }
+    }
+    if test_process_birth(pid)? != Some(birth) {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    Err(bad_inspection(&format!(
+        "{operation} failed for live PID {pid} birth {birth:?}: {failure}"
+    )))
+}
+
+fn process_executable(pid: u32) -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        retry_macos_inspection(pid, "proc_pidpath", || {
+            let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+            let size = unsafe {
+                libc::proc_pidpath(pid as i32, buf.as_mut_ptr() as *mut _, buf.len() as u32)
+            };
+            if size <= 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let end = buf
+                .iter()
+                .position(|b| *b == 0)
+                .ok_or_else(|| bad_inspection("unterminated executable"))?;
+            Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end])))
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::read_link(format!("/proc/{pid}/exe"))
+    }
+}
+
+pub fn test_process_identity(pid: u32) -> std::io::Result<Option<TestProcessIdentity>> {
+    let Some(birth) = test_process_birth(pid)? else {
+        return Ok(None);
+    };
+    let executable = match process_executable(pid) {
+        Ok(path) => path,
+        Err(_) if test_process_birth(pid)?.is_none() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(TestProcessIdentity {
+        pid,
+        birth,
+        executable,
+        import_socket: None,
+    }))
+}
+
+// macOS can briefly report the spawning executable after spawn() returns.
+// The caller keeps its direct Child guard armed until this identity settles.
+pub fn settled_herdr_identity(pid: u32) -> std::io::Result<Option<TestProcessIdentity>> {
+    let Some(birth) = test_process_birth(pid)? else {
+        return Ok(None);
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let Some(identity) = test_process_identity(pid)? else {
+            return Ok(None);
+        };
+        if identity.birth != birth {
+            return Err(bad_inspection("child birth changed during startup"));
+        }
+        if is_test_herdr_binary(&identity.executable) {
+            return Ok(Some(identity));
+        }
+        if Instant::now() >= deadline {
+            return Err(bad_inspection(
+                "child executable did not settle to Cargo Herdr",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn decode_procargs(buf: &[u8]) -> std::io::Result<Vec<String>> {
+    let argc = i32::from_ne_bytes(
+        buf.get(..4)
+            .ok_or_else(|| bad_inspection("missing argc"))?
+            .try_into()
+            .unwrap(),
+    );
+    if !(1..=4096).contains(&argc) {
+        return Err(bad_inspection("invalid argc"));
+    }
+    let mut offset = 4 + buf[4..]
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or_else(|| bad_inspection("missing executable terminator"))?;
+    while buf.get(offset) == Some(&0) {
+        offset += 1;
+    }
+    let mut args = Vec::new();
+    for _ in 0..argc {
+        let tail = buf
+            .get(offset..)
+            .ok_or_else(|| bad_inspection("truncated argv"))?;
+        let end = tail
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| bad_inspection("unterminated argv"))?;
+        args.push(
+            std::str::from_utf8(&tail[..end])
+                .map_err(|_| bad_inspection("invalid argv encoding"))?
+                .to_owned(),
+        );
+        offset += end + 1;
+    }
+    // Do not decode or log the environment tail (or the import token).
+    Ok(args)
+}
+
+#[cfg(target_os = "macos")]
+fn handoff_argv(pid: u32) -> std::io::Result<Vec<String>> {
+    retry_macos_inspection(pid, "KERN_PROCARGS2", || {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut size = buf.len();
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr() as *mut _,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        buf.truncate(size);
+        decode_procargs(&buf)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn handoff_argv(pid: u32) -> std::io::Result<Vec<String>> {
+    read_cmdline(pid)
+}
+
+fn exact_import_socket(args: &[String], dirs: &HashSet<PathBuf>) -> Option<PathBuf> {
+    if args.len() != 5 || args[1] != "server" || args[2] != "--handoff-import" {
+        return None;
+    }
+    let socket = Path::new(&args[3]);
+    if !socket.is_absolute() || args[3].split('/').any(|part| part == "." || part == "..") {
+        return None;
+    }
+    let name = socket.file_name()?.to_str()?;
+    let pid = name.strip_prefix("herdr-handoff-")?.strip_suffix(".sock")?;
+    if pid.is_empty()
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || !(1..=i32::MAX as u32).contains(&pid.parse::<u32>().ok()?)
+    {
+        return None;
+    }
+    let parent = socket.parent()?;
+    if !dirs.contains(parent)
+        && !fs::canonicalize(parent)
+            .ok()
+            .is_some_and(|p| dirs.contains(&p))
+    {
+        return None;
+    }
+    Some(socket.to_path_buf())
+}
+
+fn all_process_pids() -> std::io::Result<Vec<u32>> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut capacity = 4096;
+        for _ in 0..8 {
+            let mut pids = vec![0i32; capacity];
+            // macOS sys/proc_info.h: PROC_UID_ONLY = 4. Unlike
+            // proc_listallpids, proc_listpids returns bytes, not a PID count.
+            const PROC_UID_ONLY: u32 = 4;
+            let bytes = unsafe {
+                libc::proc_listpids(
+                    PROC_UID_ONLY,
+                    libc::geteuid(),
+                    pids.as_mut_ptr() as *mut _,
+                    (pids.len() * std::mem::size_of::<libc::pid_t>()) as i32,
+                )
+            };
+            if bytes <= 0 || !(bytes as usize).is_multiple_of(std::mem::size_of::<libc::pid_t>()) {
+                return Err(bad_inspection("current-UID process inventory failed"));
+            }
+            let count = bytes as usize / std::mem::size_of::<libc::pid_t>();
+            if count < capacity {
+                return Ok(pids
+                    .into_iter()
+                    .take(count)
+                    .filter(|p| *p > 0)
+                    .map(|p| p as u32)
+                    .collect());
+            }
+            capacity *= 2;
+        }
+        Err(bad_inspection("process inventory remained truncated"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::read_dir("/proc")?
+            .filter_map(|entry| match entry {
+                Ok(entry) => entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .map(Ok),
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
+    }
+}
+
+fn discover_imports(
+    ownership: &mut HandoffOwnership,
+    deadline: Instant,
+) -> std::io::Result<Vec<TestProcessIdentity>> {
+    #[cfg(test)]
+    if ownership.inspection_failure {
+        return Err(bad_inspection("injected fixture inspection failure"));
+    }
+    let mut found = Vec::new();
+    for pid in all_process_pids()? {
+        if Instant::now() >= deadline {
+            return Err(bad_inspection("fixture inventory deadline exceeded"));
+        }
+        // A fixture cannot own a process born before the test process that
+        // exclusively created it. This excludes pre-existing user processes
+        // before probing their executable, even if proc_pidpath is unavailable.
+        let Some(birth) = test_process_birth(pid).map_err(|error| {
+            bad_inspection(&format!("process birth inventory PID {pid}: {error}"))
+        })?
+        else {
+            continue;
+        };
+        if birth < ownership.owner_birth {
+            continue;
+        }
+        // Inspect argv only after the kernel executable matches our Cargo binary.
+        let executable = match process_executable(pid) {
+            Ok(path) => path,
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ESRCH | libc::ENOENT | libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                continue
+            }
+            Err(e) => {
+                return Err(bad_inspection(&format!(
+                    "executable inventory PID {pid}: {e}"
+                )))
+            }
+        };
+        if !is_test_herdr_binary(&executable) {
+            continue;
+        }
+        let result: std::io::Result<Option<TestProcessIdentity>> = (|| {
+            let Some(mut identity) = test_process_identity(pid)? else {
+                return Ok(None);
+            };
+            if !is_test_herdr_binary(&identity.executable) {
+                return Ok(None);
+            }
+            let args = handoff_argv(pid)?;
+            identity.import_socket = exact_import_socket(&args, &ownership.data_dirs);
+            Ok(identity.import_socket.is_some().then_some(identity))
+        })();
+        match result {
+            Ok(Some(identity)) => {
+                write_fixture_ledger(
+                    serde_json::json!({"pid": identity.pid, "birth": identity.birth, "executable": identity.executable, "kind": "import", "socket": identity.import_socket}),
+                )?;
+                if !ownership.imports.contains(&identity) {
+                    ownership.imports.push(identity.clone());
+                }
+                found.push(identity);
+            }
+            Ok(None) => {}
+            Err(_) if test_process_birth(pid)?.is_none() => {}
+            Err(e) => {
+                return Err(bad_inspection(&format!(
+                    "import identity/argv inventory PID {pid}: {e}"
+                )))
+            }
+        }
+    }
+    Ok(found)
+}
+
+pub fn handoff_replacement_pids(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
+    let state = fixture_registry()
+        .get(
+            runtime_dir
+                .parent()
+                .ok_or_else(|| bad_inspection("runtime parent missing"))?,
+        )
+        .cloned()
+        .ok_or_else(|| bad_inspection("unregistered handoff fixture"))?;
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(
+        discover_imports(&mut guard, Instant::now() + Duration::from_secs(2))?
+            .into_iter()
+            .map(|p| p.pid)
+            .collect(),
+    )
+}
+
+fn same_process(expected: &TestProcessIdentity, current: Option<&TestProcessIdentity>) -> bool {
+    current.is_some_and(|current| {
+        expected.pid > 0
+            && current.pid == expected.pid
+            && current.birth == expected.birth
+            && current.executable == expected.executable
+    })
+}
+
+fn identity_still_owned(identity: &TestProcessIdentity) -> std::io::Result<bool> {
+    let Some(current) = test_process_identity(identity.pid)? else {
+        return Ok(false);
+    };
+    if !same_process(identity, Some(&current)) {
+        return Ok(false);
+    }
+    if let Some(socket) = &identity.import_socket {
+        let args = handoff_argv(identity.pid)?;
+        let dirs = HashSet::from([socket.parent().unwrap().to_path_buf()]);
+        return Ok(exact_import_socket(&args, &dirs).as_ref() == Some(socket));
+    }
+    Ok(true)
+}
+
+pub fn terminate_test_process(
+    identity: &TestProcessIdentity,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    for (signal, grace) in [
+        (libc::SIGTERM, Duration::from_millis(400)),
+        (libc::SIGKILL, Duration::from_secs(2)),
+    ] {
+        // Never signal a reused PID, a changed executable, or a changed import.
+        if identity_still_owned(identity)?
+            && unsafe { libc::kill(identity.pid as i32, signal) } != 0
+        {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                return Err(e);
+            }
+        }
+        let end = deadline.min(Instant::now() + grace);
+        loop {
+            let mut status = 0;
+            unsafe {
+                libc::waitpid(identity.pid as i32, &mut status, libc::WNOHANG);
+            }
+            if !identity_still_owned(identity)? {
+                return Ok(());
+            }
+            if Instant::now() >= end {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Err(bad_inspection(&format!(
+        "owned PID {} birth {:?} survived bounded cleanup",
+        identity.pid, identity.birth
+    )))
+}
+
+fn finish_handoff_fixture(state: &FixtureState) -> std::io::Result<()> {
+    let mut ownership = state.lock().unwrap_or_else(|e| e.into_inner());
+    if ownership.finished {
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_secs(6);
+    for producer in &ownership.producers {
+        terminate_test_process(producer, deadline)?;
+        unregister_spawned_herdr_pid(Some(producer.pid));
+    }
+    for import in &ownership.imports {
+        terminate_test_process(import, deadline)?;
+    }
+    if ownership.starting {
+        return Err(bad_inspection("fixture still owns pending startup"));
+    }
+    if let Some(failure) = &ownership.unresolved_startup {
+        return Err(bad_inspection(failure));
+    }
+    let mut empty_scans = 0;
+    while Instant::now() < deadline {
+        let imports = discover_imports(&mut ownership, deadline)?;
+        if imports.is_empty() {
+            empty_scans += 1;
+            if empty_scans == 2 {
+                fs::remove_dir_all(&ownership.base)?;
+                unregister_runtime_dir(&ownership.base.join("runtime"));
+                fixture_registry().remove(&ownership.base);
+                ownership.finished = true;
+                return Ok(());
+            }
+        } else {
+            empty_scans = 0;
+            for import in imports {
+                terminate_test_process(&import, deadline)?;
+            }
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    Err(bad_inspection(
+        "fixture did not reach quiescence before cleanup deadline",
+    ))
+}
+
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
 
     ensure_cleanup_hooks();
-    let mut registry = pid_registry_lock();
-    registry.insert(pid);
+    if let Some(identity) = settled_herdr_identity(pid).expect("inspect registered direct child") {
+        write_fixture_ledger(serde_json::json!({"pid": pid, "birth": identity.birth, "executable": identity.executable})).expect("record direct child");
+        pid_registry_lock().insert(pid, identity);
+    }
 }
 
 pub fn unregister_spawned_herdr_pid(pid: Option<u32>) {
@@ -85,6 +818,11 @@ pub fn herdr_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<
 }
 
 pub fn cleanup_test_base(base: &Path) {
+    let fixture = fixture_registry().get(base).cloned();
+    if let Some(fixture) = fixture {
+        finish_handoff_fixture(&fixture).expect("handoff fixture cleanup");
+        return;
+    }
     let runtime_dir = base.join("runtime");
     let runtime_dirs = HashSet::from([runtime_dir.clone()]);
 
@@ -524,21 +1262,25 @@ pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result
 }
 
 pub fn cleanup_registered_herdr_pids() {
-    let pids: Vec<u32> = {
-        let mut registry = pid_registry_lock();
-        registry.drain().collect()
-    };
-
-    for pid in pids {
-        terminate_pid(pid);
+    let fixtures: Vec<_> = fixture_registry().values().cloned().collect();
+    for fixture in fixtures {
+        if let Err(error) = finish_handoff_fixture(&fixture) {
+            eprintln!("registered handoff fixture cleanup unresolved: {error}");
+        }
     }
-
-    let runtime_dirs: HashSet<PathBuf> = {
-        let mut runtime_dirs = runtime_dir_registry_lock();
-        runtime_dirs.drain().collect()
-    };
-
+    let identities: Vec<_> = pid_registry_lock().values().cloned().collect();
+    for identity in identities {
+        match terminate_test_process(&identity, Instant::now() + Duration::from_millis(2400)) {
+            Ok(()) => unregister_spawned_herdr_pid(Some(identity.pid)),
+            Err(error) => eprintln!(
+                "registered PID {} cleanup unresolved: {error}",
+                identity.pid
+            ),
+        }
+    }
+    let runtime_dirs = registered_runtime_dirs_snapshot();
     terminate_servers_for_runtime_dirs(&runtime_dirs);
+
     let _ = cleanup_servers_with_missing_runtime_dir();
 }
 
@@ -566,9 +1308,10 @@ fn ensure_cleanup_hooks() {
     });
 }
 
-fn pid_registry_lock() -> std::sync::MutexGuard<'static, HashSet<u32>> {
+fn pid_registry_lock(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<u32, TestProcessIdentity>> {
     PID_REGISTRY
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -776,63 +1519,17 @@ impl Drop for CleanupGuard {
 }
 
 fn terminate_pid(pid: u32) {
-    let pid_t = pid as libc::pid_t;
-
-    if process_exists(pid_t) {
-        unsafe {
-            libc::kill(pid_t, libc::SIGTERM);
-        }
-    }
-
-    if wait_for_pid_exit(pid_t, Duration::from_millis(400)) {
-        return;
-    }
-
-    if process_exists(pid_t) {
-        unsafe {
-            libc::kill(pid_t, libc::SIGKILL);
-        }
-    }
-
-    let _ = wait_for_pid_exit(pid_t, Duration::from_secs(2));
-}
-
-fn wait_for_pid_exit(pid: libc::pid_t, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-
-    while Instant::now() < deadline {
-        if !process_exists(pid) {
-            return true;
-        }
-
-        let mut status = 0;
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if result == pid {
-            return true;
-        }
-
-        if result == -1 {
-            match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ECHILD) => {
-                    // Not our child (or already reaped elsewhere). Poll /proc existence
-                    // until the process is truly gone.
-                    if !process_exists(pid) {
-                        return true;
-                    }
-                }
-                Some(libc::ESRCH) => return true,
-                _ => {
-                    if !process_exists(pid) {
-                        return true;
-                    }
-                }
+    match test_process_identity(pid) {
+        Ok(Some(identity)) => {
+            if let Err(error) =
+                terminate_test_process(&identity, Instant::now() + Duration::from_millis(2400))
+            {
+                eprintln!("runtime-owned PID {pid} cleanup unresolved: {error}");
             }
         }
-
-        thread::sleep(Duration::from_millis(20));
+        Ok(None) => {}
+        Err(error) => eprintln!("runtime-owned PID {pid} inspection failed: {error}"),
     }
-
-    !process_exists(pid)
 }
 
 fn process_exists(pid: libc::pid_t) -> bool {
@@ -847,6 +1544,83 @@ fn process_exists(pid: libc::pid_t) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_ownership_rejects_wrong_paths_and_malformed_arguments() {
+        let dirs = HashSet::from([PathBuf::from("/owned/config/herdr-dev/sessions/work")]);
+        let valid = vec![
+            "/cargo/herdr".to_string(),
+            "server".into(),
+            "--handoff-import".into(),
+            "/owned/config/herdr-dev/sessions/work/herdr-handoff-12.sock".into(),
+            "unused-token".into(),
+        ];
+        assert!(exact_import_socket(&valid, &dirs).is_some());
+        for socket in [
+            "herdr-handoff-12.sock",
+            "/another/config/herdr-dev/sessions/work/herdr-handoff-12.sock",
+            "/owned/config/herdr-dev/sessions/other/herdr-handoff-12.sock",
+            "/owned/config/herdr-dev/sessions/work-extra/herdr-handoff-12.sock",
+            "/owned/config/herdr-dev/sessions/work/../work/herdr-handoff-12.sock",
+            "/owned/config/herdr-dev/sessions/work/./herdr-handoff-12.sock",
+            "/owned/config/herdr-dev/sessions/work/herdr-handoff-0.sock",
+            "/owned/config/herdr-dev/sessions/work/herdr-handoff-x.sock",
+        ] {
+            let mut args = valid.clone();
+            args[3] = socket.into();
+            assert!(
+                exact_import_socket(&args, &dirs).is_none(),
+                "accepted {socket}"
+            );
+        }
+        let mut args = valid.clone();
+        args.remove(1);
+        assert!(exact_import_socket(&args, &dirs).is_none());
+        let mut args = valid;
+        args.push("extra".into());
+        assert!(exact_import_socket(&args, &dirs).is_none());
+    }
+
+    #[test]
+    fn handoff_identity_rejects_reuse_wrong_executable_and_missing_metadata() {
+        let expected = TestProcessIdentity {
+            pid: 42,
+            birth: (123, 4),
+            executable: "/cargo/herdr".into(),
+            import_socket: None,
+        };
+        assert!(same_process(&expected, Some(&expected)));
+        assert!(!same_process(&expected, None));
+        let mut reused = expected.clone();
+        reused.birth.0 += 1;
+        assert!(!same_process(&expected, Some(&reused)));
+        let mut wrong_exe = expected.clone();
+        wrong_exe.executable = "/installed/herdr".into();
+        assert!(!same_process(&expected, Some(&wrong_exe)));
+        assert!(!is_test_herdr_binary(Path::new("/installed/herdr")));
+    }
+
+    #[test]
+    fn handoff_procargs_decodes_only_argc_and_rejects_truncation() {
+        let mut bytes = 2i32.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(
+            b"/cargo/herdr\0\0/cargo/herdr\0server\0PRIVATE_ENV=must-not-decode\0",
+        );
+        assert_eq!(decode_procargs(&bytes).unwrap(), ["/cargo/herdr", "server"]);
+        for bytes in [
+            vec![],
+            0i32.to_ne_bytes().to_vec(),
+            (-1i32).to_ne_bytes().to_vec(),
+            5000i32.to_ne_bytes().to_vec(),
+            [
+                2i32.to_ne_bytes().as_slice(),
+                b"/cargo/herdr\0\0herdr\0unterminated",
+            ]
+            .concat(),
+        ] {
+            assert!(decode_procargs(&bytes).is_err());
+        }
+    }
 
     fn unique_missing_runtime_dir(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
