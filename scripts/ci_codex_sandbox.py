@@ -34,7 +34,13 @@ JOURNAL = STATE / 'journal.json'
 PARSER = '/sbin/apparmor_parser'
 PROFILE_LIST = Path('/sys/kernel/security/apparmor/profiles')
 POLICY = Path('/sys/kernel/security/apparmor/policy/profiles')
+REVISION = Path('/sys/kernel/security/apparmor/revision')
+MAX_PROFILES = 4096
+MAX_DEPTH = 64
+MAX_METADATA = 4096
+MODES = {'enforce', 'complain', 'kill', 'unconfined', 'user'}
 SCALARS = {
+    'hash_policy': Path('/sys/module/apparmor/parameters/hash_policy'),
     'apparmor_enabled': Path('/sys/module/apparmor/parameters/enabled'),
     'restrict_userns': Path('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),
     'restrict_unconfined': Path('/proc/sys/kernel/apparmor_restrict_unprivileged_unconfined'),
@@ -103,36 +109,118 @@ def restrictions():
         try:
             value = path.read_text().strip()
         except FileNotFoundError:
-            require(key not in ('apparmor_enabled', 'restrict_userns'), 'mandatory_restriction_missing')
+            require(key not in ('apparmor_enabled', 'restrict_userns', 'hash_policy'), 'mandatory_restriction_missing')
             value = None
-        require(value in ('Y', 'N') if key == 'apparmor_enabled' else value in ('0', '1', None), 'unknown_restriction')
+        require(value in ('Y', 'N') if key in ('apparmor_enabled', 'hash_policy') else value in ('0', '1', None), 'unknown_restriction')
         result[key] = value
     require(result['apparmor_enabled'] == 'Y' and result['restrict_userns'] == '1', 'restrictions_disabled')
+    require(result['hash_policy'] == 'Y', 'policy_hash_disabled')
     require(result['userns_clone'] in ('1', None), 'incompatible_restrictions')
     return result
 
 
+def bounded_text(path, limit, category):
+    # securityfs metadata has finite content; read only one bounded chunk.
+    try:
+        with path.open('rb') as handle:
+            data = handle.read(limit + 2)
+        require(data.endswith(b'\n') and len(data) <= limit + 1, category)
+        value = data[:-1].decode('utf-8')
+        require(value and not any(ord(c) < 32 or ord(c) == 127 for c in value), category)
+        return value
+    except (OSError, UnicodeError):
+        raise Refused(category) from None
+
+
+def policy_epoch():
+    # A read-until-EOF can wait for the NEXT policy revision. Never poll/retry.
+    try:
+        fd = os.open(REVISION, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            data = os.read(fd, 32)
+        finally:
+            os.close(fd)
+    except OSError:
+        raise Refused('policy_revision_unavailable') from None
+    require(len(data) < 32 and re.fullmatch(rb'[0-9]+\n', data), 'policy_revision_invalid')
+    return int(data[:-1])
+
+
 def profiles():
-    values = PROFILE_LIST.read_text().splitlines()
-    require(len(values) == len(set(values)), 'profile_inventory_uncertain')
+    try:
+        with PROFILE_LIST.open('rb') as handle:
+            data = handle.read(MAX_PROFILES * (MAX_METADATA + 16) + 1)
+        require(len(data) <= MAX_PROFILES * (MAX_METADATA + 16), 'profile_inventory_uncertain')
+        values = data.decode('utf-8').splitlines()
+    except (OSError, UnicodeError):
+        raise Refused('profile_inventory_uncertain') from None
+    require(len(values) <= MAX_PROFILES and len(values) == len(set(values)), 'profile_inventory_uncertain')
     return sorted(values)
 
 
 def attachments():
+    """Private hierarchical metadata; no raw values are public diagnostics."""
     require(POLICY.is_dir(), 'attachment_inventory_unavailable')
-    result = []
-    def visit(parent):
-        for entry in parent.iterdir():
-            if not entry.is_dir():
-                continue
-            name = (entry / 'name').read_text().strip()
-            attach = (entry / 'attach').read_text().strip()
-            result.append((name, attach))
-            children = entry / 'profiles'
-            if children.exists():
-                visit(children)
-    visit(POLICY)
+    result = {}
+    def visit(parent, ancestors=()):
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                require(len(ancestors) < MAX_DEPTH, 'attachment_inventory_invalid')
+                require(len(result) < MAX_PROFILES and entry.is_dir(follow_symlinks=False),
+                        'attachment_inventory_invalid')
+                path = Path(entry.path)
+                name = bounded_text(path / 'name', MAX_METADATA, 'attachment_inventory_invalid')
+                require('//' not in name and not name.startswith(':') and ' (' not in name,
+                        'attachment_inventory_invalid')
+                full = '//'.join((*ancestors, name))
+                require(len(full.encode()) <= MAX_METADATA and full not in result, 'attachment_inventory_invalid')
+                mode = bounded_text(path / 'mode', 16, 'attachment_inventory_invalid')
+                require(mode in MODES, 'attachment_inventory_invalid')
+                attach = bounded_text(path / 'attach', MAX_METADATA, 'attachment_inventory_invalid')
+                try:
+                    # Missing baseline hashes may be unknown; present malformed hashes never are.
+                    with (path / 'sha256').open('rb') as handle:
+                        raw_hash = handle.read(66)
+                except FileNotFoundError:
+                    kernel_hash = None
+                else:
+                    require(re.fullmatch(rb'[0-9a-f]{64}\n', raw_hash), 'policy_hash_invalid')
+                    kernel_hash = raw_hash[:-1].decode('ascii')
+                result[full] = {'mode': mode, 'attach': attach, 'sha256': kernel_hash}
+                children = path / 'profiles'
+                if children.exists():
+                    require(children.is_dir() and not children.is_symlink(), 'attachment_inventory_invalid')
+                    visit(children, (*ancestors, name))
+    try:
+        visit(POLICY)
+    except OSError:
+        raise Refused('attachment_inventory_unavailable') from None
     return result
+
+
+def snapshot():
+    before = policy_epoch()
+    listed = profiles()
+    inventory = attachments()
+    after = policy_epoch()
+    require(before == after, 'policy_revision_changed')
+    require(sorted(name + ' (' + item['mode'] + ')' for name, item in inventory.items()) == listed,
+            'attachment_inventory_uncertain')
+    return {'epoch': after, 'inventory': inventory}
+
+
+def inventory_summary(observed):
+    inventory = observed['inventory']
+    opaque = any(item['attach'] == '<unknown>' for item in inventory.values())
+    overlaps = any(item['attach'] != '<unknown>' and attachment_may_match(item['attach'])
+                   for item in inventory.values())
+    owned_names = any(part in ('bwrap', 'unpriv_bwrap') for name in inventory for part in name.split('//'))
+    hashes = sum(item['sha256'] is not None for item in inventory.values())
+    return {'inventory': 'complete', 'owned_names': 'present' if owned_names else 'absent',
+            'attachment_overlap': 'mixed' if opaque and overlaps else 'known_or_possible' if overlaps else
+                                  'opaque_only' if opaque else 'none',
+            'sha256_support': 'all' if hashes == len(inventory) else 'some' if hashes else 'none',
+            'revision': 'stable', 'profile_count': len(inventory)}
 
 
 def no_customization():
@@ -192,6 +280,8 @@ def attachment_may_match(attachment):
     if re.fullmatch(r'[a-zA-Z0-9_.:+ -]+', attachment):
         # apparmorfs returns the plain profile name when no xmatch is present.
         return False
+    if '@' in attachment or '\\' in attachment or any(ord(c) < 32 or ord(c) == 127 for c in attachment):
+        return True
     pending = [attachment]
     expanded = []
     while pending:
@@ -199,12 +289,14 @@ def attachment_may_match(attachment):
         match = re.search(r'\{([^{}]+)\}', value)
         if match:
             parts = match[1].split(',')
-            if len(parts) < 2 or len(pending) + len(expanded) + len(parts) > 128:
+            if any(not part for part in parts) or len(parts) < 2 or len(pending) + len(expanded) + len(parts) > 128:
                 return True
             pending.extend(value[:match.start()] + part + value[match.end():] for part in parts)
         else:
             expanded.append(value)
     for value in expanded:
+        if '{' in value or '}' in value or value.count('[') != value.count(']'):
+            return True
         prefix = re.split(r'[*?\[{}\\@]', value, maxsplit=1)[0]
         if not prefix.startswith('/') or str(BWRAP).startswith(prefix):
             return True
@@ -260,18 +352,31 @@ def preflight():
     require(Path(PARSER).is_file() and os.access(PARSER, os.X_OK), 'parser_unavailable')
     for name in ('abi/4.0', 'tunables/global'):
         require((PROFILE.parent / name).is_file(), 'profile_include_unavailable')
-    original = profiles()
-    require(not any(v.split(' (', 1)[0] in ('bwrap', 'unpriv_bwrap') for v in original), 'profile_collision')
-    observed = attachments()
-    require(len(observed) == len(original), 'attachment_inventory_uncertain')
-    require(not any(name in ('bwrap', 'unpriv_bwrap') or attachment_may_match(attach)
-                    for name, attach in observed), 'attachment_collision')
     try:
         source, data = resource()
         source_identity = identity(source, root=False)
     except (Refused, OSError, ValueError, KeyError):
         raise Refused('preflight_provider_resource') from None
-    return {'schema': 1, 'uid': uid, 'restrictions': restrictions(), 'profiles': original,
+    scalar_values = restrictions()
+    try:
+        observed = snapshot()
+    except Refused as error:
+        category = str(error)
+        summary = {'inventory': 'changed' if category == 'policy_revision_changed' else
+                   'unavailable' if category.endswith('_unavailable') else 'invalid',
+                   'owned_names': 'unknown', 'attachment_overlap': 'invalid',
+                   'sha256_support': 'invalid' if category == 'policy_hash_invalid' else 'unavailable',
+                   'revision': 'changed' if category == 'policy_revision_changed' else
+                   'invalid' if category == 'policy_revision_invalid' else 'unavailable'}
+        print(json.dumps({'preflight_metadata': summary}, sort_keys=True), flush=True)
+        raise
+    summary = inventory_summary(observed)
+    print(json.dumps({'preflight_metadata': summary}, sort_keys=True), flush=True)
+    require(summary['owned_names'] == 'absent', 'profile_collision')
+    require(summary['attachment_overlap'] in ('none', 'opaque_only'), 'attachment_collision')
+    return {'schema': 2, 'uid': uid, 'restrictions': scalar_values,
+            'baseline': observed['inventory'], 'epoch': observed['epoch'], 'owned_metadata': {},
+            'pending_removal': None,
             'source_identity': source_identity, 'source_hash': digest(data),
             'parents': {}, 'files': {}, 'load_attempted': False, 'load_observed': False,
             'loaded': [], 'phase': 'registered'}
@@ -280,6 +385,13 @@ def preflight():
 def write_journal(record):
     # Atomic replacement only inside our root-owned directory; never a caller path.
     chain(STATE)
+    # Retain a marker across any failed commit, including rename/directory fsync.
+    # Clearing it is the final syscall; a crash can conservatively retain it.
+    pending = STATE / 'journal.pending'
+    with pending.open('x') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.flush()
+        os.fsync(handle.fileno())
     temporary = STATE / 'journal.next'
     with temporary.open('x') as handle:
         os.chmod(temporary, 0o600)
@@ -287,13 +399,21 @@ def write_journal(record):
         handle.flush()
         os.fsync(handle.fileno())
     temporary.replace(JOURNAL)
+    fd = os.open(STATE, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    pending.unlink()
 
 
 def read_journal():
     chain(STATE)
+    require(not (STATE / 'journal.pending').exists() and not (STATE / 'journal.pending').is_symlink(),
+            'journal_write_uncertain')
     identity(JOURNAL, mode=0o600)
     record = json.loads(JOURNAL.read_text())
-    require(record.get('schema') == 1 and record.get('uid') == target(root=True), 'journal_identity_mismatch')
+    require(record.get('schema') == 2 and record.get('uid') == target(root=True), 'journal_identity_mismatch')
     require(set(record.get('parents', {})) <= {'parent', 'runtime'} and
             set(record.get('files', {})) <= {'binary', 'profile', 'archive'} and
             set(record.get('loaded', [])) <= OWNED_PROFILES and
@@ -308,28 +428,45 @@ def verify_source(record):
     no_customization()
 
 
-def verify_added_attachments(added, category):
-    expected = {'bwrap': str(BWRAP), 'unpriv_bwrap': 'unpriv_bwrap'}
-    expected = {name: attach for name, attach in expected.items() if name + ' (enforce)' in added}
-    observed = [(name, attach) for name, attach in attachments() if name in ('bwrap', 'unpriv_bwrap')]
-    # Check count as well as contents so duplicate names cannot hide uncertainty.
-    require(len(observed) == len(expected) and dict(observed) == expected, category)
+def observed_owned(record, remaining, epoch, category):
+    observed = snapshot()
+    require(observed['epoch'] == epoch, 'policy_revision_changed')
+    expected_names = {name.split(' (', 1)[0] for name in remaining}
+    inventory = observed['inventory']
+    baseline = {name: item for name, item in inventory.items() if name not in expected_names}
+    require(baseline == record['baseline'], category)
+    owned = {name: item for name, item in inventory.items() if name in expected_names}
+    require(set(owned) == expected_names, category)
+    for name, item in owned.items():
+        require(item['mode'] == 'enforce', category)
+        require(item['sha256'] is not None and re.fullmatch(r'[0-9a-f]{64}', item['sha256']), 'owned_policy_hash_missing')
+        allowed = (str(BWRAP), '<unknown>') if name == 'bwrap' else ('unpriv_bwrap',)
+        require(item['attach'] in allowed, category)
+    return owned
+
+
+def verify_owned_files(record):
+    for key, path in (('parent', RUNTIME_PARENT), ('runtime', RUNTIME)):
+        if key in record['parents']:
+            require(identity(path, directory=True, mode=0o755) == record['parents'][key], 'owned_parent_changed')
+    for key, path, mode in (('binary', BWRAP, 0o755), ('profile', PROFILE, 0o644)):
+        item = record['files'].get(key)
+        if item:
+            chain(path.parent)
+            require(identity(path, mode=mode) == item['identity'] and digest(path.read_bytes()) == item['hash'],
+                    'owned_binary_changed' if key == 'binary' else 'owned_profile_changed')
+        else:
+            require(not path.exists() and not path.is_symlink(), 'cleanup_unowned_file')
 
 
 def verify_owned(record):
     verify_source(record)
-    require(record.get('load_observed') is True and set(record['loaded']) == OWNED_PROFILES,
-            'loaded_profile_drift')
-    for key, path in (('parent', RUNTIME_PARENT), ('runtime', RUNTIME)):
-        if key in record['parents']:
-            require(identity(path, directory=True, mode=0o755) == record['parents'][key], 'owned_parent_changed')
-    chain(RUNTIME)
-    require(identity(BWRAP, mode=0o755) == record['files']['binary']['identity'] and
-            digest(BWRAP.read_bytes()) == RESOURCE_HASH, 'owned_binary_changed')
-    require(identity(PROFILE, mode=0o644) == record['files']['profile']['identity'] and
-            digest(PROFILE.read_bytes()) == record['files']['profile']['hash'], 'owned_profile_changed')
-    require(profiles() == sorted(record['profiles'] + list(OWNED_PROFILES)), 'loaded_profile_drift')
-    verify_added_attachments(OWNED_PROFILES, 'owned_attachment_changed')
+    require(record.get('load_observed') is True and set(record['loaded']) == OWNED_PROFILES and
+            record.get('pending_removal') is None, 'loaded_profile_drift')
+    verify_owned_files(record)
+    require(set(record['files']) >= {'binary', 'profile'}, 'loaded_profile_drift')
+    owned = observed_owned(record, record['loaded'], record['epoch'], 'owned_attachment_changed')
+    require(owned == record['owned_metadata'], 'owned_attachment_changed')
 
 
 def apply():
@@ -357,27 +494,30 @@ def apply():
             write_journal(record)
         verify_source(record)
         run([PARSER, '-Q', '-T', '-K', str(PROFILE)])
-        require(profiles() == record['profiles'], 'preload_profile_drift')
+        require(snapshot() == {'epoch': record['epoch'], 'inventory': record['baseline']}, 'preload_profile_drift')
         record['load_attempted'] = True
         write_journal(record)
-        try:
-            run([PARSER, '-a', '-T', '-K', str(PROFILE)])
-        finally:
-            current = set(profiles())
-            added = current & OWNED_PROFILES
-            require(current - added == set(record['profiles']), 'loaded_profile_drift')
-            verify_added_attachments(added, 'owned_attachment_changed')
-            record['loaded'] = sorted(added)
-            record['load_observed'] = True
-            write_journal(record)
+        run([PARSER, '-a', '-T', '-K', str(PROFILE)])
+        # Appearing names after any failed/uncertain compound add are NOT owned.
+        owned = observed_owned(record, OWNED_PROFILES, record['epoch'] + 2, 'owned_attachment_changed')
+        record['loaded'] = sorted(OWNED_PROFILES)
+        record['owned_metadata'] = owned
+        record['epoch'] += 2
+        record['load_observed'] = True
+        write_journal(record)
         verify_owned(record)
         record['phase'] = 'applied'
         write_journal(record)
         return {'apply': 'PASS', 'resource_sha256': RESOURCE_HASH, 'profile_source_sha256': PROFILE_HASH,
-                'profile_runtime_sha256': digest(profile), 'package_version': PACKAGE_VERSION}
-    except BaseException:
-        # Preserve the root journal even if rollback cannot establish ownership.
-        cleanup()
+                'profile_runtime_sha256': digest(profile), 'package_version': PACKAGE_VERSION,
+                'owned_policy_hashes': 'confirmed', 'owned_policy_epoch': 'confirmed_plus_two',
+                'bwrap_attachment': 'opaque' if owned['bwrap']['attach'] == '<unknown>' else 'literal'}
+    except BaseException as original:
+        # Preserve both failures, without formatting private exception text.
+        try:
+            cleanup()
+        except BaseException as rollback_error:
+            raise CleanupFailed(original, rollback_error) from None
         raise
 
 
@@ -390,28 +530,38 @@ def cleanup():
     record = read_journal()
     fixture_identity = fixture_status_verified(record)
     verify_source(record)
-    current = set(profiles())
-    require(current - OWNED_PROFILES == set(record['profiles']), 'cleanup_profile_drift')
-    # An interrupted parser/observation/journal write leaves ownership unknown,
-    # even if a later inventory is empty. Preserve recovery evidence in that case.
+    # Uncertain compound add or an uncheckpointed remove never authorizes unload.
     require(not record['load_attempted'] or record.get('load_observed') is True, 'cleanup_unowned_profile')
-    recorded = set(record['loaded'])
-    require(current & OWNED_PROFILES <= recorded, 'cleanup_unowned_profile')
-    added = current & recorded
-    require(not added or record['load_attempted'], 'cleanup_unowned_profile')
-    verify_added_attachments(added, 'cleanup_attachment_changed')
+    require(record.get('pending_removal') is None, 'cleanup_removal_uncertain')
+    verify_owned_files(record)
+    added = set(record['loaded'])
+    owned = observed_owned(record, added, record['epoch'], 'cleanup_attachment_changed')
+    require(owned == record['owned_metadata'], 'cleanup_attachment_changed')
     if added:
-        item = record['files'].get('profile')
-        require(item and identity(PROFILE, mode=0o644) == item['identity'] and
-                digest(PROFILE.read_bytes()) == item['hash'], 'cleanup_profile_changed')
-        # On partial parser success remove only the exact profiles observed added.
         content = PROFILE.read_bytes()
         split = content.index(b'profile unpriv_bwrap ')
         for name, data in (('unpriv_bwrap (enforce)', content[:content.index(b'profile bwrap ')] + content[split:]),
                            ('bwrap (enforce)', content[:split])):
             if name in added:
+                # Recheck before EACH destructive operation, then journal intent.
+                verify_source(record)
+                verify_owned_files(record)
+                require(observed_owned(record, added, record['epoch'], 'cleanup_attachment_changed') ==
+                        record['owned_metadata'], 'cleanup_attachment_changed')
+                record['pending_removal'] = name
+                write_journal(record)
                 run([PARSER, '-R', '-T', '-K'], data=data)
-        require(profiles() == record['profiles'], 'cleanup_profiles_not_restored')
+                remaining = added - {name}
+                expected = {key: value for key, value in record['owned_metadata'].items()
+                            if key != name.split(' (', 1)[0]}
+                observed = observed_owned(record, remaining, record['epoch'] + 1, 'cleanup_profiles_not_restored')
+                require(observed == expected, 'cleanup_attachment_changed')
+                record['loaded'] = sorted(remaining)
+                record['owned_metadata'] = expected
+                record['epoch'] += 1
+                record['pending_removal'] = None
+                write_journal(record)
+                added = remaining
     for key, path in (('profile', PROFILE), ('binary', BWRAP)):
         item = record['files'].get(key)
         if item:
@@ -428,7 +578,7 @@ def cleanup():
             del record['parents'][key]
             write_journal(record)
     verify_source(record)
-    require(profiles() == record['profiles'], 'cleanup_profiles_not_restored')
+    require(snapshot() == {'epoch': record['epoch'], 'inventory': record['baseline']}, 'cleanup_profiles_not_restored')
     # Archive debris is private and fixed-shape, but still identity/hash checked.
     archives = list(STATE.glob('apparmor-profiles_*.deb'))
     item = record['files'].get('archive')
@@ -558,7 +708,18 @@ def fixtures(stage):
             'baseline_lsm_attribution': 'unknown'}
 
 
-FAILURE_CATEGORIES = frozenset(('preflight_runtime_parent_chain', 'preflight_profile_parent_chain', 'preflight_state_parent_chain', 'preflight_provider_resource')) | frozenset(('fixture_status_parent_uncertain', 'fixture_status_owner')) | frozenset(('profile_parse_failed', 'profile_add_failed', 'profile_remove_failed', 'profile_download_failed', 'profile_extract_failed')) | frozenset(('attachment_collision', 'attachment_inventory_unavailable', 'attachment_inventory_uncertain', 'candidate_fixtures_failed', 'candidate_hash_mismatch', 'cleanup_archive_changed', 'cleanup_attachment_changed', 'cleanup_file_changed', 'cleanup_parent_changed', 'cleanup_paths_not_restored', 'cleanup_profile_changed', 'cleanup_profile_drift', 'cleanup_profiles_not_restored', 'cleanup_unknown_debris', 'cleanup_unowned_file', 'cleanup_unowned_profile', 'file_capability', 'fixture_cleanup_unverified', 'fixture_report_malformed', 'incompatible_restrictions', 'journal_identity_mismatch', 'journal_schema_mismatch', 'loaded_profile_drift', 'mandatory_restriction_missing', 'operation_failed', 'owned_attachment_changed', 'owned_binary_changed', 'owned_parent_changed', 'owned_path_collision', 'owned_profile_changed', 'parser_unavailable', 'preload_profile_drift', 'profile_archive_count', 'profile_collision', 'profile_customization_present', 'profile_include_unavailable', 'profile_inventory_uncertain', 'profile_member_mismatch', 'profile_package_mismatch', 'profile_source_mismatch', 'provider_identity_changed', 'provider_native_count', 'provider_package_mismatch', 'provider_path_uncertain', 'provider_resource_count', 'provider_resource_mismatch', 'restriction_drift', 'restrictions_disabled', 'setup_missing', 'unknown_restriction', 'unsafe_file_mode', 'unsafe_file_owner', 'unsafe_file_type', 'wrong_ci_target', 'wrong_fixture_user', 'wrong_target'))
+FAILURE_CATEGORIES = frozenset(('attachment_inventory_invalid', 'policy_hash_disabled', 'policy_hash_invalid', 'policy_revision_unavailable', 'policy_revision_invalid', 'policy_revision_changed', 'owned_policy_hash_missing', 'cleanup_removal_uncertain', 'journal_write_uncertain')) | frozenset(('preflight_runtime_parent_chain', 'preflight_profile_parent_chain', 'preflight_state_parent_chain', 'preflight_provider_resource')) | frozenset(('fixture_status_parent_uncertain', 'fixture_status_owner')) | frozenset(('profile_parse_failed', 'profile_add_failed', 'profile_remove_failed', 'profile_download_failed', 'profile_extract_failed')) | frozenset(('attachment_collision', 'attachment_inventory_unavailable', 'attachment_inventory_uncertain', 'candidate_fixtures_failed', 'candidate_hash_mismatch', 'cleanup_archive_changed', 'cleanup_attachment_changed', 'cleanup_file_changed', 'cleanup_parent_changed', 'cleanup_paths_not_restored', 'cleanup_profile_changed', 'cleanup_profile_drift', 'cleanup_profiles_not_restored', 'cleanup_unknown_debris', 'cleanup_unowned_file', 'cleanup_unowned_profile', 'file_capability', 'fixture_cleanup_unverified', 'fixture_report_malformed', 'incompatible_restrictions', 'journal_identity_mismatch', 'journal_schema_mismatch', 'loaded_profile_drift', 'mandatory_restriction_missing', 'operation_failed', 'owned_attachment_changed', 'owned_binary_changed', 'owned_parent_changed', 'owned_path_collision', 'owned_profile_changed', 'parser_unavailable', 'preload_profile_drift', 'profile_archive_count', 'profile_collision', 'profile_customization_present', 'profile_include_unavailable', 'profile_inventory_uncertain', 'profile_member_mismatch', 'profile_package_mismatch', 'profile_source_mismatch', 'provider_identity_changed', 'provider_native_count', 'provider_package_mismatch', 'provider_path_uncertain', 'provider_resource_count', 'provider_resource_mismatch', 'restriction_drift', 'restrictions_disabled', 'setup_missing', 'unknown_restriction', 'unsafe_file_mode', 'unsafe_file_owner', 'unsafe_file_type', 'wrong_ci_target', 'wrong_fixture_user', 'wrong_target'))
+
+
+def failure_category(error):
+    return str(error) if isinstance(error, Refused) and str(error) in FAILURE_CATEGORIES else 'experiment_gate_failed'
+
+
+class CleanupFailed(Refused):
+    def __init__(self, original, cleanup_error):
+        self.original = failure_category(original)
+        self.cleanup_error = failure_category(cleanup_error)
+        super().__init__(self.original)
 
 
 def main():
@@ -589,8 +750,11 @@ def main():
     except (Refused, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         # Refused originates only at fixed literal require sites. Do not format
         # raw OS/subprocess/provider exceptions.
-        category = str(error) if isinstance(error, Refused) and str(error) in FAILURE_CATEGORIES else 'experiment_gate_failed'
-        print(json.dumps({'mode': args.mode, 'result': 'FAIL', 'diagnostic': category}))
+        failure = {'mode': args.mode, 'result': 'FAIL', 'diagnostic': failure_category(error)}
+        if isinstance(error, CleanupFailed):
+            failure['original_operation_failure'] = error.original
+            failure['cleanup_failure'] = error.cleanup_error
+        print(json.dumps(failure))
         return 1
 
 

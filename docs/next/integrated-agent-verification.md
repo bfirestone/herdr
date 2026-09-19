@@ -252,15 +252,44 @@ Preflight checks existing ABI/include support, scalar restrictions, root-owned
 nonwritable parent chains, absent owned files/profiles, and absent optional local
 profile customizations. Failed runtime, profile and state parent-chain checks,
 and provider-resource checks, emit distinct fixed `preflight_*` categories;
-paths, ownership metadata and raw exception text are not emitted. It inventories loaded attachment expressions and proves
-non-overlap using literal prefixes and bounded finite brace alternatives;
-ambiguous expressions fail closed. Kernel `attach` output of `<unknown>` is
-ambiguous, while an unattached profile reports its plain name. See the
-[Linux AppArmor filesystem implementation](https://github.com/torvalds/linux/blob/v6.8/security/apparmor/apparmorfs.c#L1025).
+paths, ownership metadata and raw exception text are not emitted. Run
+`35421006303` passed the new path checks, then refused `attachment_collision`
+before apply. Its actual collision subtype remains unknown; neither failed
+preflight loaded policy or staged the runtime.
+
+The bounded private inventory reconciles hierarchical profile identities and modes
+with the profile list: at most 4096 entries, depth 64 and 4096 UTF-8 bytes per
+name/attachment. Nested owned-name collisions, malformed/unreadable metadata and
+known or possible overlaps refuse. Exact kernel `attach` output `<unknown>` means
+unavailable attachment text, not a proven conflict or disjointness. The pinned
+parser serializes the attachment DFA without its literal string; the
+[Linux AppArmor filesystem implementation](https://github.com/torvalds/linux/blob/v6.8/security/apparmor/apparmorfs.c#L1092)
+returns that sentinel for this representation. Existing opaque entries are accepted
+only under this disposable CI contract, with a fresh protected executable path and
+mandatory real child selection proof. This does not establish global noninterference.
+Read-only preflight emits only fixed inventory, overlap, owned-name, hash-support
+and revision categories, plus a bounded profile count, before apply.
+
+A fresh nonblocking descriptor reads the policy revision once, at most 32 bytes,
+and closes; no EOF loop or polling is used. Strict decimal/newline validation and
+equal revisions around each inventory are mandatory. `hash_policy` must already
+be `Y`; it is never enabled by this experiment. Optional missing baseline profile
+hashes remain unknown, but malformed present hashes refuse. Both new profiles
+must expose valid kernel SHA256 hashes. These hash compiled policy payloads, not
+the textual profile file. Existing restriction values remain unchanged.
+
 The root-owned private journal is registered before runtime/policy mutation.
 Only a no-load parse and add of the two absent profiles are supported, never
-replacement or a service reload. Optional missing restriction scalars remain
-unknown; existing values are compared unchanged, never written.
+replacement or a service reload. The pinned parser loads the two top-level
+profiles individually: ownership is confirmed only after the entire add succeeds,
+the epoch advances by exactly two, baseline inventory is unchanged, and both
+profiles are observed in enforce mode with valid hashes. `bwrap` may initially
+report the exact staged literal or exact opaque sentinel; `unpriv_bwrap` must
+report its plain name. The exact observed representations and hashes are durably
+recorded and must remain equal. Failed/interrupted adds or uncertain observation
+or journaling never acquire ownership of appearing names; the journal is retained
+and cleanup refuses to unload them. An incomplete journal commit retains an
+explicit marker that also blocks cleanup.
 
 The candidate prepends the staged directory only to the fixture subprocess PATH.
 The provider and all proof children remain the original nonroot runner user.
@@ -293,16 +322,30 @@ The final workflow step always attempts exact owned rollback after an attempted
 apply. Before any candidate provider starts, a fresh fixed runner-owned status
 record is created; it records each launcher's successful observed reap. An
 incomplete/malformed status prevents root cleanup from removing policy underneath
-an uncertain provider tree. Root cleanup only unloads the profiles observed added
-by this invocation, verifies file identity/hash/ownership, removes matching owned
-files and newly created parents, preserves preexisting parents, and checks original
-restrictions/provider bytes/profile inventory and path absence. Interrupted or
-tampered state is retained and fails the job; runner disposal is extra containment,
-not evidence of verified cleanup. Before publication the candidate commit can be
-reverted; the published diagnostic base remains the configuration rollback.
+an uncertain provider tree. Before any removal, root cleanup checks the original
+restrictions and provider bytes, owned file identity/hash/ownership, unchanged
+baseline inventory, confirmed owned modes/hashes/representations and recorded
+epoch. Each single-profile removal must advance the epoch by exactly one and
+remove exactly that profile. The remaining owned set and new epoch are durably
+checkpointed before another removal. Unexpected revisions (including same-hash
+replacement), representation/hash drift or an interrupted removal stop cleanup
+and retain evidence. Original operation failure and cleanup failure remain
+separate fixed categories, without raw exception text.
+
+Cleanup then removes matching owned files and newly created parents, preserves
+preexisting parents, and checks original restrictions/provider bytes/profile
+inventory and path absence. Epoch restoration is not expected: confirmed owned
+adds/removals naturally advance it. This is a conservative concurrency check,
+not kernel compare-and-delete; it relies on an exclusive disposable CI policy
+manager and does not protect against malicious concurrent root. Runner disposal
+is extra containment, not evidence of verified cleanup. Before publication the
+candidate commit can be reverted; the published diagnostic base remains the
+configuration rollback.
 
 Offline tests simulate Linux kernel/package-manager boundaries and exercise
-collision, tamper, partial-add rollback, unknown ownership, redaction, child
+hierarchical/opaque inventory, bounded nonblocking epoch reads, hash-policy and
+owned-hash requirements, failed compound-add ownership refusal, epoch drift,
+per-removal durable checkpoints, tamper, unknown ownership, redaction, child
 observations and denial controls. They run through the existing Rust integration
 gate. They are **not host-kernel or live CI enforcement evidence**. This candidate
 still needs one independently reviewed, published exact-commit branch run showing

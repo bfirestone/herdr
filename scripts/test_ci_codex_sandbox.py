@@ -25,6 +25,9 @@ class SimulatedLinux:
         self.stack = ExitStack()
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory())).resolve()
         self.loaded = ['unrelated (enforce)']
+        self.epoch = 100
+        self.opaque = False
+        self.hashes = {}
         self.commands = []
         self.fail = None
         self.source = self.root / 'provider-bwrap'
@@ -52,10 +55,11 @@ class SimulatedLinux:
         original_identity = sandbox.identity
         self.patch('identity', lambda path, **kwargs: original_identity(path, **dict(kwargs, root=False)))
         self.patch('no_customization', lambda: None)
-        self.scalars = {'apparmor_enabled': 'Y', 'restrict_userns': '1', 'restrict_unconfined': None, 'userns_clone': '1'}
+        self.scalars = {'hash_policy': 'Y', 'apparmor_enabled': 'Y', 'restrict_userns': '1', 'restrict_unconfined': None, 'userns_clone': '1'}
         self.patch('restrictions', lambda: dict(self.scalars))
         self.patch('profiles', lambda: sorted(self.loaded))
         self.patch('attachments', self.attachments)
+        self.patch('policy_epoch', lambda: self.epoch)
         self.patch('download_profile', self.download)
         self.patch('run', self.run)
         return self
@@ -64,7 +68,9 @@ class SimulatedLinux:
         self.stack.close()
 
     def attachments(self):
-        return [(value.split(' (')[0], str(sandbox.BWRAP) if value.startswith('bwrap (') else value.split(' (')[0]) for value in self.loaded]
+        return {value.split(' (')[0]: {'mode': value.split(' (')[1][:-1],
+                'attach': ('<unknown>' if self.opaque else str(sandbox.BWRAP)) if value.startswith('bwrap (') else value.split(' (')[0],
+                'sha256': self.hashes.get(value.split(' (')[0], 'a' * 64)} for value in self.loaded}
 
     def download(self, record):
         archive = sandbox.STATE / 'apparmor-profiles_simulated.deb'
@@ -78,11 +84,14 @@ class SimulatedLinux:
         if '-a' in argv:
             if self.fail == 'partial_add':
                 self.loaded.append('bwrap (enforce)')
+                self.epoch += 1
                 raise sandbox.Refused('profile_add_failed')
             self.loaded.extend(sandbox.OWNED_PROFILES)
+            self.epoch += 2
         if '-R' in argv:
             name = 'unpriv_bwrap' if b'profile unpriv_bwrap ' in kwargs['data'] else 'bwrap'
             self.loaded.remove(name + ' (enforce)')
+            self.epoch += 1
         if self.fail and self.fail in argv:
             raise sandbox.Refused('profile_parse_failed')
         return b''
@@ -200,14 +209,14 @@ class SandboxTests(unittest.TestCase):
                     self.assertEqual(host.commands, [])
 
     def test_profile_collision_and_ambiguous_attachment_stop_preflight(self):
-        for loaded, attached in [(['bwrap (complain)'], [('bwrap', str(sandbox.BWRAP))]),
-                                 (['other (enforce)'], [('other', '/var/**')])]:
-            with SimulatedLinux(), mock.patch.object(sandbox, 'profiles', return_value=loaded), mock.patch.object(
-                    sandbox, 'attachments', return_value=attached) as observation:
-                if loaded == ['other (enforce)']:
-                    observation.return_value = [('other', str(sandbox.RUNTIME_PARENT) + '/**')]
-                with self.assertRaises(sandbox.Refused):
-                    sandbox.preflight()
+        for loaded in (['bwrap (complain)'], ['other (enforce)']):
+            with SimulatedLinux() as host:
+                host.loaded = loaded
+                observed = host.attachments()
+                observed[next(iter(observed))]['attach'] = str(sandbox.RUNTIME_PARENT) + '/**'
+                with mock.patch.object(sandbox, 'attachments', return_value=observed):
+                    with self.assertRaises(sandbox.Refused):
+                        sandbox.preflight()
                 self.assertFalse(sandbox.STATE.exists())
 
     def test_apply_verify_second_preview_cleanup_and_operation_order(self):
@@ -239,43 +248,35 @@ class SandboxTests(unittest.TestCase):
             sandbox.cleanup()
             self.assertTrue(sandbox.RUNTIME_PARENT.is_dir())
 
-    def test_parse_and_partial_add_failure_roll_back_only_added_profiles(self):
+    def test_parse_failure_restores_files_but_partial_add_retains_unknown_ownership(self):
         for failure in ('-Q', 'partial_add'):
             with self.subTest(failure=failure), SimulatedLinux() as host:
                 host.fail = failure
                 with self.assertRaises(sandbox.Refused):
                     sandbox.apply()
-                self.assertFalse(sandbox.STATE.exists())
-                self.assertFalse(sandbox.PROFILE.exists())
-                self.assertEqual(host.loaded, ['unrelated (enforce)'])
-                removed = [kwargs['data'] for argv, kwargs in host.commands if '-R' in argv]
-                self.assertEqual(len(removed), 1 if failure == 'partial_add' else 0)
-                if removed:
-                    self.assertNotIn(b'profile unpriv_bwrap ', removed[0])
+                self.assertEqual(sandbox.STATE.exists(), failure == 'partial_add')
+                self.assertEqual(sandbox.PROFILE.exists(), failure == 'partial_add')
+                self.assertEqual(host.loaded, ['unrelated (enforce)', 'bwrap (enforce)'] if failure == 'partial_add' else ['unrelated (enforce)'])
+                self.assertFalse(any('-R' in argv for argv, _ in host.commands))
 
     def test_partial_add_recovery_refuses_later_unrecorded_profile_before_any_removal(self):
         with SimulatedLinux() as host:
             host.fail = 'partial_add'
-            with mock.patch.object(sandbox, 'cleanup', side_effect=sandbox.Refused('interrupted_rollback')):
-                with self.assertRaises(sandbox.Refused):
-                    sandbox.apply()
+            with self.assertRaises(sandbox.Refused):
+                sandbox.apply()
             record = sandbox.read_journal()
-            self.assertEqual(record['loaded'], ['bwrap (enforce)'])
-            self.assertIs(record['load_observed'], True)
+            self.assertEqual(record['loaded'], [])
+            self.assertIs(record['load_observed'], False)
             host.loaded.append('unpriv_bwrap (enforce)')
-            with self.assertRaisesRegex(sandbox.Refused, 'cleanup_unowned_profile'):
-                sandbox.cleanup()
-            self.assertFalse(any('-R' in argv for argv, _ in host.commands))
-            self.assertEqual(sandbox.read_journal(), record)
-            self.assertTrue(sandbox.BWRAP.exists())
-            self.assertTrue(sandbox.PROFILE.exists())
-            # Once the independently added profile is gone, recorded ownership
-            # still permits recovery of this invocation's partial addition.
-            host.loaded.remove('unpriv_bwrap (enforce)')
-            self.assertEqual(sandbox.cleanup()['cleanup'], 'PASS')
-            removed = [kwargs['data'] for argv, kwargs in host.commands if '-R' in argv]
-            self.assertEqual(len(removed), 1)
-            self.assertNotIn(b'profile unpriv_bwrap ', removed[0])
+            for present in (True, False):
+                if not present:
+                    host.loaded.remove('unpriv_bwrap (enforce)')
+                with self.assertRaisesRegex(sandbox.Refused, 'cleanup_unowned_profile'):
+                    sandbox.cleanup()
+                self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+                self.assertEqual(sandbox.read_journal(), record)
+                self.assertTrue(sandbox.BWRAP.exists())
+                self.assertTrue(sandbox.PROFILE.exists())
 
     def test_uncertain_load_observation_or_journal_write_retains_recovery_state(self):
         for failure in ('inventory', 'attachments', 'journal'):
@@ -321,11 +322,11 @@ class SandboxTests(unittest.TestCase):
                     sandbox.apply()
                     observed = host.attachments()
                     if duplicate:
-                        observed.append((name, 'unexpected'))
+                        observed['parent//' + name] = dict(observed[name])
                     else:
-                        observed = [(key, 'unexpected' if key == name else value) for key, value in observed]
+                        observed[name]['attach'] = 'unexpected'
                     with mock.patch.object(sandbox, 'attachments', return_value=observed):
-                        with self.assertRaisesRegex(sandbox.Refused, 'cleanup_attachment_changed'):
+                        with self.assertRaisesRegex(sandbox.Refused, 'cleanup_attachment_changed|attachment_inventory_uncertain'):
                             sandbox.cleanup()
                     self.assertFalse(any('-R' in argv for argv, _ in host.commands))
                     self.assertTrue(sandbox.JOURNAL.exists())
@@ -477,6 +478,278 @@ class SandboxTests(unittest.TestCase):
                 self.assertEqual(sandbox.main(), 1)
             self.assertEqual(json.loads(output.getvalue())['diagnostic'], category)
             self.assertNotIn('private-token', output.getvalue())
+
+    def test_epoch_is_one_bounded_nonblocking_read_and_always_closes(self):
+        for data, expected in ((b'0\n', 0), (b'120\n', 120), (b'', None), (b'-1\n', None),
+                               (b'1', None), (b'1\n2\n', None), (b' 1\n', None),
+                               (b'9' * 31 + b'\n', None), (b'\xff\n', None)):
+            with self.subTest(data=data), mock.patch.object(os, 'open', return_value=17) as opened, mock.patch.object(
+                    os, 'read', return_value=data) as read, mock.patch.object(os, 'close') as close:
+                if expected is None:
+                    with self.assertRaisesRegex(sandbox.Refused, 'policy_revision_invalid'):
+                        sandbox.policy_epoch()
+                else:
+                    self.assertEqual(sandbox.policy_epoch(), expected)
+                opened.assert_called_once_with(sandbox.REVISION, os.O_RDONLY | os.O_NONBLOCK)
+                read.assert_called_once_with(17, 32)
+                close.assert_called_once_with(17)
+        for error in (BlockingIOError('private'), OSError('private')):
+            with mock.patch.object(os, 'open', return_value=17), mock.patch.object(os, 'read', side_effect=error) as read, mock.patch.object(os, 'close') as close:
+                with self.assertRaisesRegex(sandbox.Refused, '^policy_revision_unavailable$'):
+                    sandbox.policy_epoch()
+                read.assert_called_once_with(17, 32)
+                close.assert_called_once_with(17)
+        with mock.patch.object(os, 'open', side_effect=FileNotFoundError('private')), mock.patch.object(os, 'close') as close:
+            with self.assertRaisesRegex(sandbox.Refused, '^policy_revision_unavailable$'):
+                sandbox.policy_epoch()
+            close.assert_not_called()
+
+    def test_real_hierarchical_inventory_reconciles_modes_names_hashes_and_bounds(self):
+        def entry(parent, identifier, name, attach=None, kernel_hash='a' * 64, mode='enforce'):
+            path = parent / identifier
+            path.mkdir(parents=True)
+            for key, value in (('name', name), ('attach', attach or name), ('mode', mode)):
+                (path / key).write_text(value + '\n')
+            if kernel_hash is not None:
+                (path / 'sha256').write_text(kernel_hash + '\n')
+            return path
+        with tempfile.TemporaryDirectory() as temporary:
+            policy = Path(temporary) / 'profiles'
+            parent = entry(policy, 'kernel-id1', 'parent', '<unknown>', None)
+            child = entry(parent / 'profiles', 'kernel-id2', 'child')
+            listed = Path(temporary) / 'list'
+            listed.write_text('parent (enforce)\nparent//child (enforce)\n')
+            with mock.patch.object(sandbox, 'POLICY', policy), mock.patch.object(sandbox, 'PROFILE_LIST', listed), mock.patch.object(sandbox, 'policy_epoch', return_value=10):
+                observed = sandbox.snapshot()
+                self.assertEqual(set(observed['inventory']), {'parent', 'parent//child'})
+                summary = sandbox.inventory_summary(observed)
+                self.assertEqual(summary['attachment_overlap'], 'opaque_only')
+                self.assertEqual(summary['sha256_support'], 'some')
+                for key, invalid in (('name', 'parent//child'), ('name', 'x' * 4097), ('attach', ''),
+                                     ('attach', '<unknown>\nextra'), ('sha256', ''),
+                                     ('sha256', 'A' * 64), ('sha256', 'a' * 65), ('mode', 'unexpected')):
+                    with self.subTest(key=key, invalid=invalid[:15]):
+                        old = (child / key).read_bytes()
+                        (child / key).write_text(invalid + '\n')
+                        with self.assertRaises(sandbox.Refused):
+                            sandbox.snapshot()
+                        (child / key).write_bytes(old)
+                duplicate = entry(policy, 'different-kernel-id', 'parent')
+                with self.assertRaisesRegex(sandbox.Refused, 'attachment_inventory_invalid'):
+                    sandbox.snapshot()
+                for path in duplicate.iterdir():
+                    path.unlink()
+                duplicate.rmdir()
+                for bound, limit in (('MAX_PROFILES', 1), ('MAX_DEPTH', 1)):
+                    with mock.patch.object(sandbox, bound, limit), self.assertRaises(sandbox.Refused):
+                        sandbox.snapshot()
+                listed.write_text('parent (enforce)\nchild (enforce)\n')
+                with self.assertRaisesRegex(sandbox.Refused, 'attachment_inventory_uncertain'):
+                    sandbox.snapshot()
+                (child / 'attach').unlink()
+                with self.assertRaisesRegex(sandbox.Refused, 'attachment_inventory_invalid'):
+                    sandbox.attachments()
+
+    def test_opaque_baseline_is_explicit_and_known_mixed_nested_or_invalid_refuse(self):
+        for case in ('opaque', 'known', 'mixed', 'nested', 'unreadable', 'epoch'):
+            with self.subTest(case=case), SimulatedLinux() as host:
+                observed = host.attachments()
+                observed['unrelated']['attach'] = '<unknown>'
+                if case in ('known', 'mixed'):
+                    if case == 'known':
+                        observed['unrelated']['attach'] = str(sandbox.BWRAP)
+                    else:
+                        host.loaded.append('private-name (enforce)')
+                        observed['private-name'] = {'mode': 'enforce', 'attach': '/**', 'sha256': None}
+                if case == 'nested':
+                    host.loaded.append('unrelated//bwrap (enforce)')
+                    observed['unrelated//bwrap'] = {'mode': 'enforce', 'attach': '<unknown>', 'sha256': None}
+                with mock.patch.object(sandbox, 'attachments', side_effect=sandbox.Refused('attachment_inventory_invalid') if case == 'unreadable' else None,
+                                       return_value=observed), mock.patch.object(sandbox, 'policy_epoch', side_effect=[100, 101] if case == 'epoch' else None,
+                                       return_value=100), redirect_stdout(io.StringIO()) as output:
+                    if case == 'opaque':
+                        self.assertEqual(sandbox.preflight()['baseline'], observed)
+                    else:
+                        with self.assertRaises(sandbox.Refused):
+                            sandbox.preflight()
+                report = json.loads(output.getvalue())['preflight_metadata']
+                if case in ('known', 'mixed', 'opaque'):
+                    self.assertEqual(report['attachment_overlap'], {'known': 'known_or_possible', 'mixed': 'mixed', 'opaque': 'opaque_only'}[case])
+                self.assertNotIn('private-name', output.getvalue())
+                self.assertNotIn('<unknown>', output.getvalue())
+                self.assertNotIn('a' * 64, output.getvalue())
+                self.assertEqual(host.commands, [])
+                self.assertFalse(sandbox.STATE.exists())
+        for pattern in ('/else/@{VAR}', '/else/{broken', '/else/[broken', '/else/\\escape', '/else/{,var}'):
+            self.assertTrue(sandbox.attachment_may_match(pattern))
+
+    def test_hash_policy_is_mandatory_Y_and_never_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = {key: Path(temporary) / key for key in sandbox.SCALARS}
+            values = {'hash_policy': 'Y', 'apparmor_enabled': 'Y', 'restrict_userns': '1', 'restrict_unconfined': '1', 'userns_clone': '1'}
+            for key, value in values.items():
+                paths[key].write_text(value + '\n')
+            with mock.patch.object(sandbox, 'SCALARS', paths):
+                self.assertEqual(sandbox.restrictions(), values)
+                for value in ('N', 'invalid', None):
+                    if value is None:
+                        paths['hash_policy'].unlink()
+                    else:
+                        paths['hash_policy'].write_text(value + '\n')
+                    with self.assertRaises(sandbox.Refused):
+                        sandbox.restrictions()
+                    self.assertEqual(paths['hash_policy'].read_text() if value else None, value + '\n' if value else None)
+
+    def test_add_confirms_only_success_plus_two_and_binds_hash_and_representation(self):
+        for opaque in (True, False):
+            with self.subTest(opaque=opaque), SimulatedLinux() as host:
+                host.opaque = opaque
+                host.hashes = {'unrelated': None, 'bwrap': 'b' * 64, 'unpriv_bwrap': 'c' * 64}
+                result = sandbox.apply()
+                record = sandbox.read_journal()
+                self.assertEqual(record['epoch'], 102)
+                self.assertEqual(record['owned_metadata']['bwrap']['sha256'], 'b' * 64)
+                self.assertNotEqual(record['owned_metadata']['bwrap']['sha256'], record['files']['profile']['hash'])
+                self.assertEqual(result['bwrap_attachment'], 'opaque' if opaque else 'literal')
+                for drift in ('hash', 'representation', 'epoch'):
+                    before = dict(host.hashes), host.opaque, host.epoch
+                    if drift == 'hash':
+                        host.hashes['bwrap'] = 'd' * 64
+                    elif drift == 'representation':
+                        host.opaque = not host.opaque
+                    else:
+                        host.epoch += 1  # Includes same-hash replacements.
+                    with self.assertRaises(sandbox.Refused):
+                        sandbox.verify_owned(record)
+                    with self.assertRaises(sandbox.Refused):
+                        sandbox.cleanup()
+                    self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+                    host.hashes, host.opaque, host.epoch = before
+                self.assertEqual(sandbox.cleanup()['cleanup'], 'PASS')
+                self.assertEqual(host.epoch, 104)
+
+    def test_successful_parser_with_bad_hash_mode_epoch_or_baseline_never_owns(self):
+        for fault in ('missing_hash', 'bad_hash', 'wrong_mode', 'delta_zero', 'delta_one', 'delta_three', 'baseline'):
+            with self.subTest(fault=fault), SimulatedLinux() as host:
+                real_run = host.run
+                def command(argv, **kwargs):
+                    result = real_run(argv, **kwargs)
+                    if '-a' in argv:
+                        if fault in ('missing_hash', 'bad_hash'):
+                            host.hashes['bwrap'] = None if fault == 'missing_hash' else 'BAD'
+                        elif fault == 'wrong_mode':
+                            host.loaded.remove('bwrap (enforce)')
+                            host.loaded.append('bwrap (complain)')
+                        elif fault == 'baseline':
+                            host.hashes['unrelated'] = 'd' * 64
+                        else:
+                            host.epoch = 100 + {'delta_zero': 0, 'delta_one': 1, 'delta_three': 3}[fault]
+                    return result
+                with mock.patch.object(sandbox, 'run', side_effect=command):
+                    with self.assertRaises(sandbox.CleanupFailed) as failure:
+                        sandbox.apply()
+                self.assertEqual(failure.exception.cleanup_error, 'cleanup_unowned_profile')
+                record = sandbox.read_journal()
+                self.assertFalse(record['load_observed'])
+                self.assertEqual(record['loaded'], [])
+                self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+
+    def test_failed_add_with_zero_one_or_two_appearing_names_never_unloads(self):
+        for count in (0, 1, 2):
+            with self.subTest(count=count), SimulatedLinux() as host:
+                def command(argv, **kwargs):
+                    if '-a' not in argv:
+                        return host.run(argv, **kwargs)
+                    host.commands.append((argv, kwargs))
+                    host.loaded.extend(sorted(sandbox.OWNED_PROFILES)[:count])
+                    host.epoch += count
+                    raise sandbox.Refused('profile_add_failed')
+                with mock.patch.object(sandbox, 'run', side_effect=command), mock.patch('sys.argv', ['helper', 'apply']), redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(sandbox.main(), 1)
+                report = json.loads(output.getvalue().splitlines()[-1])
+                self.assertEqual(report['original_operation_failure'], 'profile_add_failed')
+                self.assertEqual(report['cleanup_failure'], 'cleanup_unowned_profile')
+                self.assertFalse(sandbox.read_journal()['load_observed'])
+                with self.assertRaisesRegex(sandbox.Refused, 'cleanup_unowned_profile'):
+                    sandbox.cleanup()
+                self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+                self.assertTrue(sandbox.BWRAP.exists())
+
+    def test_cleanup_requires_each_remove_plus_one_and_durable_checkpoint(self):
+        for fault in ('no_epoch', 'extra_epoch', 'not_removed', 'remove_error', 'checkpoint_error'):
+            with self.subTest(fault=fault), SimulatedLinux() as host:
+                sandbox.apply()
+                real_run = host.run
+                real_write = sandbox.write_journal
+                def command(argv, **kwargs):
+                    result = real_run(argv, **kwargs)
+                    if '-R' in argv:
+                        if fault == 'no_epoch':
+                            host.epoch -= 1
+                        elif fault == 'extra_epoch':
+                            host.epoch += 1
+                        elif fault == 'not_removed':
+                            host.loaded.append('unpriv_bwrap (enforce)')
+                        elif fault == 'remove_error':
+                            raise sandbox.Refused('profile_remove_failed')
+                    return result
+                def journal(record):
+                    if fault == 'checkpoint_error' and record['epoch'] == 103:
+                        raise OSError('private checkpoint error')
+                    return real_write(record)
+                with mock.patch.object(sandbox, 'run', side_effect=command), mock.patch.object(sandbox, 'write_journal', side_effect=journal):
+                    with self.assertRaises((sandbox.Refused, OSError)):
+                        sandbox.cleanup()
+                self.assertEqual(sum('-R' in argv for argv, _ in host.commands), 1)
+                self.assertEqual(sandbox.read_journal()['pending_removal'], 'unpriv_bwrap (enforce)')
+                with self.assertRaisesRegex(sandbox.Refused, 'cleanup_removal_uncertain'):
+                    sandbox.cleanup()
+                self.assertEqual(sum('-R' in argv for argv, _ in host.commands), 1)
+                self.assertTrue(sandbox.PROFILE.exists())
+
+    def test_cleanup_can_resume_after_confirmed_first_removal_checkpoint(self):
+        with SimulatedLinux() as host:
+            sandbox.apply()
+            real_verify = sandbox.verify_source
+            def verify(record):
+                if record['epoch'] == 103:
+                    raise KeyboardInterrupt()
+                real_verify(record)
+            with mock.patch.object(sandbox, 'verify_source', side_effect=verify), self.assertRaises(KeyboardInterrupt):
+                sandbox.cleanup()
+            record = sandbox.read_journal()
+            self.assertEqual(record['epoch'], 103)
+            self.assertEqual(record['loaded'], ['bwrap (enforce)'])
+            self.assertEqual(set(record['owned_metadata']), {'bwrap'})
+            self.assertIsNone(record['pending_removal'])
+            self.assertEqual(sum('-R' in argv for argv, _ in host.commands), 1)
+            self.assertEqual(sandbox.cleanup()['cleanup'], 'PASS')
+            self.assertEqual(sum('-R' in argv for argv, _ in host.commands), 2)
+            self.assertEqual(host.epoch, 104)
+
+    def test_journal_directory_sync_failure_after_confirming_add_cannot_authorize_cleanup(self):
+        with SimulatedLinux() as host:
+            fsync = os.fsync
+            def sync(fd):
+                if stat.S_ISDIR(os.fstat(fd).st_mode) and host.epoch == 102:
+                    raise OSError('private fsync failure')
+                return fsync(fd)
+            with mock.patch.object(os, 'fsync', side_effect=sync), self.assertRaises(sandbox.CleanupFailed) as failure:
+                sandbox.apply()
+            self.assertEqual(failure.exception.cleanup_error, 'journal_write_uncertain')
+            self.assertTrue((sandbox.STATE / 'journal.pending').exists())
+            with self.assertRaisesRegex(sandbox.Refused, 'journal_write_uncertain'):
+                sandbox.cleanup()
+            self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+            self.assertTrue(sandbox.BWRAP.exists())
+
+    def test_dual_failure_redaction_never_formats_private_exceptions(self):
+        error = sandbox.CleanupFailed(OSError('private path uid argv'), sandbox.Refused('private raw error'))
+        with mock.patch('sys.argv', ['helper', 'apply']), mock.patch.object(sandbox, 'apply', side_effect=error), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(sandbox.main(), 1)
+        self.assertEqual(json.loads(output.getvalue()), {'mode': 'apply', 'result': 'FAIL',
+                         'diagnostic': 'experiment_gate_failed', 'original_operation_failure': 'experiment_gate_failed',
+                         'cleanup_failure': 'experiment_gate_failed'})
 
 
 if __name__ == '__main__':
