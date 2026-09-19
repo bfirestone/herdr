@@ -83,7 +83,7 @@ jobs:
                   '--scratch', str(Path(tempfile.gettempdir()).resolve() / ('herdr-codex-' + nonce)),
                   '--provider-path', str(provider.resolve()),
                   '--herdr-bin', str(Path('target/debug/herdr').resolve()),
-              ], check=False)
+              ] + (['--diagnose-provider-runtime'] if os.uname().sysname == 'Linux' else []), check=False)
               if result.returncode:
                   failures.append(name)
           assert not failures, 'unverified provider fixtures: ' + ', '.join(failures)

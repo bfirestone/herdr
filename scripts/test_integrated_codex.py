@@ -619,6 +619,116 @@ def fixture_command_failure(result):
     return detail
 
 
+# Literal, source-backed message observations, never extracted paths or suffixes.
+# Each label matches any alternative whose literals all occur in one stream.
+RUNTIME_SIGNATURES = (
+    ('bwrap_build', (('error building bubblewrap command:',),)),
+    ('readonly_writable_symlink', (('cannot enforce sandbox read-only path', 'because it crosses writable symlink'),)),
+    ('denyread_writable_symlink', (('cannot enforce sandbox deny-read path', 'because it crosses writable symlink'),)),
+    ('unreadable_glob', (('cannot be safely expanded',), ('ripgrep unreadable glob scan failed',),
+                         ('unreadable glob pattern is invalid',), ('unreadable glob matcher failed',))),
+    ('bwrap_unavailable', (('bubblewrap is unavailable:',),)),
+    ('bwrap_message', (('bwrap:',),)),
+    ('namespace_message', (('namespace', 'bwrap:'), ('error isolating linux network namespace',))),
+    ('proc_mount', (("can't mount proc", '/newroot/proc'),)),
+    ('inner_mount_verify', (('failed to verify descriptor-backed bubblewrap mount:',),)),
+    ('inner_capabilities', (('failed to verify linux sandbox capabilities:',),
+                            ('linux sandbox retained effective or permitted capabilities',))),
+    ('sandbox_restrictions', (('error applying linux sandbox restrictions:',),
+                              ('error applying legacy linux sandbox restrictions:',))),
+    ('child_exec', (('failed to execvp',),)),
+    ('protected_metadata', (('sandbox blocked creation of protected workspace metadata path',),)),
+    ('python_loader', (('error while loading shared libraries:', 'libpython'),)),
+    ('python_traceback', (('traceback (most recent call last):',),)),
+    ('permission', (('permission denied',),)),
+    ('missing', (('no such file or directory',),)),
+    ('exec_format', (('exec format error',),)),
+    ('operation_not_permitted', (('operation not permitted',),)),
+    ('invalid_argument', (('invalid argument',),)),
+)
+
+
+def runtime_exit_code(result):
+    value = result.get('exitCode') if isinstance(result, dict) else None
+    return value if type(value) is int and -(2 ** 31) <= value < 2 ** 31 else None
+
+
+def runtime_output_metadata(result, key):
+    value = result.get(key)
+    kind = 'absent' if key not in result else 'string' if isinstance(value, str) else 'other'
+    # JSON may contain lone surrogate escapes. Replace them privately; never
+    # format decoding exceptions or retain another provider-output buffer.
+    data = value.encode('utf-8', errors='replace') if kind == 'string' else b''
+    scan = data[:65536]
+    text = scan.decode('utf-8', errors='ignore').lower()
+    signatures = [label for label, alternatives in RUNTIME_SIGNATURES
+                  if any(all(literal in text for literal in literals) for literals in alternatives)]
+    return {'type': kind, 'observed_utf8_bytes': min(len(data), 4194305),
+            'scan_utf8_bytes': len(scan), 'scan_truncated': len(data) > len(scan),
+            'signatures': signatures, 'unmatched_nonempty': bool(data) and not signatures}
+
+
+def runtime_probe_observation(result=None, outcome='not_run'):
+    response = result if isinstance(result, dict) else {}
+    return {'exit_code': runtime_exit_code(result), 'outcome': outcome,
+            'stdout': runtime_output_metadata(response, 'stdout'),
+            'stderr': runtime_output_metadata(response, 'stderr')}
+
+
+def diagnose_provider_runtime(client, root, python, original):
+    """At most two supplemental requests; the failed control is never retried."""
+    deadline = time.monotonic() + 65
+    detail = {'original_control': runtime_probe_observation(original, 'response'),
+              'true': runtime_probe_observation(), 'python_startup': runtime_probe_observation(),
+              'python_started': False}
+    for name, command in (('true', ['/bin/true']),
+                          ('python_startup', [python, '-c', "print('HERDR_DIAG_PYTHON_STARTED', flush=True)"])):
+        try:
+            if time.monotonic() >= deadline:
+                raise ProofFailure('fixture_provider_deadline')
+            observe_owned(client, client.child.pid)
+            if client.child.poll() is not None:
+                raise ProofFailure('fixture_provider_exited')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProofFailure('fixture_provider_deadline')
+            request = client.request('command/exec', {'command': command, 'cwd': str(root), 'timeoutMs': 10000})
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProofFailure('fixture_provider_deadline')
+            result = client.response(request, timeout=min(30, remaining))
+            if time.monotonic() >= deadline:
+                raise ProofFailure('fixture_provider_deadline')
+            if runtime_exit_code(result) is None:
+                detail[name] = runtime_probe_observation(result, 'malformed_result')
+                break
+            detail[name] = runtime_probe_observation(result, 'response')
+            if name == 'python_startup':
+                detail['python_started'] = result['exitCode'] == 0 and result.get('stdout') == 'HERDR_DIAG_PYTHON_STARTED\n'
+        except Exception as error:
+            # Provider text, including unexpected exception contents, is never
+            # interpolated. Only exact internal categories select an outcome.
+            outcome = 'transport_error'
+            if isinstance(error, ProofFailure):
+                outcome = {
+                    'fixture_provider_request_error': 'rpc_error',
+                    'fixture_provider_deadline': 'deadline',
+                    'fixture_input_bound': 'bound', 'fixture_output_bound': 'bound',
+                    'fixture_stderr_bound': 'bound', 'fixture_pending_bound': 'bound',
+                    'fixture_provider_exited': 'provider_exit',
+                    'process_inspection_unavailable': 'ownership_unverified',
+                }.get(error.args[0] if error.args and type(error.args[0]) is str else '', 'transport_error')
+            elif isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+                outcome = 'deadline'
+            elif isinstance(error, (ValueError, KeyError, TypeError)):
+                outcome = 'malformed_result'
+            detail[name] = runtime_probe_observation(outcome=outcome)
+            break
+    # Every value above is an explicit scalar or fixed signature. Even with all
+    # signatures in every stream this schema fits in 8 KiB (covered by tests).
+    return detail
+
+
 def provider_fixtures(args):
     validate_targets(args.session, args.scratch)
     process_parents()
@@ -651,8 +761,13 @@ def provider_fixtures(args):
                 client.call('command/exec/write', {'processId': process_id,
                             'deltaBase64': base64.b64encode(b'pty-ok' if mode == 'pty' else b'child-only').decode(), 'closeStdin': mode == 'pipe'})
             result = client.response(request_id)
+            diagnose = getattr(args, 'diagnose_provider_runtime', False) and os.sys.platform == 'linux'
+            if diagnose and runtime_exit_code(result) is None:
+                raise ProofFailure('fixture_malformed_result')
             if result['exitCode'] != 0:
                 report.update(fixture_command_failure(result))
+                if diagnose and mode == 'null':
+                    report['runtime_diagnostics'] = diagnose_provider_runtime(client, root, python, result)
                 raise ProofFailure('fixture_tool_failed_' + mode)
             output = client.output(process_id).split(b'READY\n', 1)[-1] if mode != 'null' else result['stdout']
             observation = json.loads(output)
@@ -730,12 +845,246 @@ def provider_fixtures(args):
             shutil.rmtree(root)
         else:
             report['owned_cleanup'] = 'UNVERIFIED'
-            report['diagnostic'] = str(errors[0])
+            if 'runtime_diagnostics' not in report:
+                report['diagnostic'] = str(errors[0])
         print(json.dumps(report, sort_keys=True))
     return 0 if all(report[key].startswith('PASS') for key in ('tool_fd_isolation', 'hook_fd_isolation', 'mcp_fd_isolation', 'owned_cleanup')) else 1
 
 
 class SafetyTests(unittest.TestCase):
+    def diagnostic_fixture(self, results, enabled=True, platform='linux', cleanup_error=False):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve() / ('herdr-codex-' + 'e' * 32)
+        args = argparse.Namespace(session='codex-proof-' + 'e' * 32, scratch=root,
+                                  provider_path=Path('/unused'), diagnose_provider_runtime=enabled)
+        provider = mock.Mock()
+        provider.child.pid = 111
+        provider.child.poll.return_value = None
+        provider.owned_children = set()
+        provider.cleanup_failure = None
+        provider.response.side_effect = results
+        if cleanup_error:
+            provider.close.side_effect = ProofFailure('fixture_owned_tree_cleanup')
+        def start(*args, **kwargs):
+            kwargs['owners'].append(provider)
+            return provider
+        output = io.StringIO()
+        with mock.patch(__name__ + '.validate_provider', return_value='/unused'), mock.patch(
+                __name__ + '.process_parents', return_value={}), mock.patch(
+                __name__ + '.DirectProvider', side_effect=start), mock.patch.object(
+                os.sys, 'platform', platform), redirect_stdout(output):
+            status = provider_fixtures(args)
+        return status, json.loads(output.getvalue()), provider, root
+
+    def test_runtime_diagnostics_latch_control_and_send_only_two_exact_probes(self):
+        original = {'exitCode': 1, 'stdout': 'private sentinel', 'stderr': ''}
+        status, report, provider, root = self.diagnostic_fixture([
+            original, {'exitCode': 0}, {'exitCode': 0, 'stdout': 'HERDR_DIAG_PYTHON_STARTED\n'}])
+        self.assertEqual(status, 1)
+        self.assertEqual(report['diagnostic'], 'fixture_tool_failed_null')
+        self.assertEqual(report['tool_failure_exit_code'], 1)
+        self.assertEqual(report['qualification'], 'UNVERIFIED')
+        self.assertEqual(report['tool_fd_isolation'], 'UNVERIFIED')
+        detail = report['runtime_diagnostics']
+        self.assertEqual(detail['original_control']['exit_code'], 1)
+        self.assertTrue(detail['python_started'])
+        python = str(Path(os.sys.executable).resolve())
+        commands = [[python, str(root / 'descriptor_child.py'), 'null', '-'], ['/bin/true'],
+                    [python, '-c', "print('HERDR_DIAG_PYTHON_STARTED', flush=True)"]]
+        self.assertEqual(provider.request.call_args_list, [mock.call('command/exec', {
+            'command': command, 'cwd': str(root), 'timeoutMs': 10000}) for command in commands])
+        self.assertEqual(provider.response.call_count, 3)
+        provider.call.assert_not_called()
+        provider.close.assert_called_once()
+        self.assertFalse(root.exists())
+        self.assertNotIn('private sentinel', json.dumps(report))
+        self.assertEqual(original, {'exitCode': 1, 'stdout': 'private sentinel', 'stderr': ''})
+
+    def test_runtime_diagnostics_default_and_success_do_not_probe(self):
+        status, report, provider, _ = self.diagnostic_fixture([{'exitCode': 1}], enabled=False)
+        self.assertEqual(status, 1)
+        self.assertNotIn('runtime_diagnostics', report)
+        self.assertEqual(provider.request.call_count, 1)
+        # A passing null response reaches the existing descriptor oracle; it must
+        # not take the supplemental failure path, even when opt-in is enabled.
+        with mock.patch(__name__ + '.diagnose_provider_runtime') as diagnose:
+            status, report, provider, _ = self.diagnostic_fixture([
+                {'exitCode': 0, 'stdout': '{"fds": []}'}])
+        diagnose.assert_not_called()
+        self.assertEqual(provider.request.call_count, 1)
+        self.assertNotIn('runtime_diagnostics', report)
+
+    def test_runtime_diagnostics_cli_restricts_opt_in_to_linux_fixtures(self):
+        argv = ['proof', '--session', 'unused', '--scratch', '/unused',
+                '--provider-path', '/unused', '--herdr-bin', '/unused']
+        for platform, fixture, enabled, allowed in [
+                ('linux', True, True, True), ('darwin', True, True, False),
+                ('linux', False, True, False), ('darwin', True, False, True),
+                ('linux', False, False, True)]:
+            with self.subTest(platform=platform, fixture=fixture, enabled=enabled), mock.patch.object(
+                    os.sys, 'platform', platform), mock.patch.object(os.sys, 'argv', argv +
+                    (['--provider-fixtures-only'] if fixture else []) +
+                    (['--diagnose-provider-runtime'] if enabled else [])), mock.patch(
+                    __name__ + '.provider_fixtures', return_value=17) as fixtures, mock.patch(
+                    __name__ + '.live', return_value=17) as live, mock.patch('sys.stderr', new_callable=io.StringIO):
+                if allowed:
+                    self.assertEqual(main(), 17)
+                    (fixtures if fixture else live).assert_called_once()
+                else:
+                    with self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 2)
+                    fixtures.assert_not_called()
+                    live.assert_not_called()
+
+    def test_runtime_diagnostics_fixed_metadata_utf8_caps_and_secret_redaction(self):
+        private = '/private/secret-value-environment-name'
+        metadata = runtime_output_metadata({'stdout': 'BWRAP: namespace ' + private}, 'stdout')
+        self.assertEqual(metadata['signatures'], ['bwrap_message', 'namespace_message'])
+        self.assertFalse(metadata['unmatched_nonempty'])
+        self.assertNotIn(private, json.dumps(metadata))
+        for result, expected in [({}, 'absent'), ({'stdout': None}, 'other'),
+                                 ({'stdout': {'secret': private}}, 'other'), ({'stdout': ''}, 'string')]:
+            item = runtime_output_metadata(result, 'stdout')
+            self.assertEqual(item['type'], expected)
+            self.assertEqual(item['observed_utf8_bytes'], 0)
+            self.assertFalse(item['unmatched_nonempty'])
+        item = runtime_output_metadata({'stdout': 'é' * 32768 + 'permission denied'}, 'stdout')
+        self.assertEqual(item['scan_utf8_bytes'], 65536)
+        self.assertEqual(item['observed_utf8_bytes'], 65536 + len('permission denied'))
+        self.assertTrue(item['scan_truncated'])
+        self.assertEqual(item['signatures'], [])
+        self.assertTrue(item['unmatched_nonempty'])
+        item = runtime_output_metadata({'stdout': 'x' * 65535 + '😀permission denied'}, 'stdout')
+        self.assertEqual(item['scan_utf8_bytes'], 65536)
+        self.assertEqual(item['signatures'], [])
+        huge = runtime_output_metadata({'stdout': '😀' * 1048577}, 'stdout')
+        self.assertEqual(huge['observed_utf8_bytes'], 4194305)
+        self.assertTrue(huge['scan_truncated'])
+        # Lone JSON surrogate escapes must never escape through an exception.
+        self.assertEqual(runtime_output_metadata({'stdout': '\ud800'}, 'stdout')['type'], 'string')
+
+    def test_runtime_diagnostics_signatures_and_maximum_schema_size(self):
+        text = ('error building bubblewrap command: cannot enforce sandbox read-only path '
+                'because it crosses writable symlink cannot enforce sandbox deny-read path '
+                'cannot be safely expanded bubblewrap is unavailable: bwrap: namespace '
+                "can't mount proc /newroot/proc failed to verify descriptor-backed bubblewrap mount: "
+                'failed to verify linux sandbox capabilities: error applying linux sandbox restrictions: '
+                'failed to execvp sandbox blocked creation of protected workspace metadata path '
+                'error while loading shared libraries: libpython traceback (most recent call last): '
+                'permission denied no such file or directory exec format error operation not permitted invalid argument')
+        result = {'exitCode': -(2 ** 31), 'stdout': text, 'stderr': text}
+        provider = mock.Mock()
+        provider.child.poll.return_value = None
+        provider.response.return_value = result
+        with mock.patch(__name__ + '.observe_owned'):
+            detail = diagnose_provider_runtime(provider, Path('/unused'), '/python', result)
+        expected = ['bwrap_build', 'readonly_writable_symlink', 'denyread_writable_symlink',
+                    'unreadable_glob', 'bwrap_unavailable', 'bwrap_message', 'namespace_message',
+                    'proc_mount', 'inner_mount_verify', 'inner_capabilities', 'sandbox_restrictions',
+                    'child_exec', 'protected_metadata', 'python_loader', 'python_traceback',
+                    'permission', 'missing', 'exec_format', 'operation_not_permitted', 'invalid_argument']
+        for name in ('original_control', 'true', 'python_startup'):
+            for stream in ('stdout', 'stderr'):
+                self.assertEqual(detail[name][stream]['signatures'], expected)
+        self.assertLessEqual(len(json.dumps(detail).encode()), 8192)
+        self.assertFalse(detail['python_started'])
+
+    def test_runtime_diagnostics_malformed_responses_and_errors_stop_probes(self):
+        cases = [(None, 'malformed_result'), ([], 'malformed_result'),
+                 ({}, 'malformed_result'), ({'exitCode': True}, 'malformed_result'),
+                 ({'exitCode': 2 ** 31}, 'malformed_result'),
+                 (ProofFailure('fixture_provider_request_error'), 'rpc_error'),
+                 (ProofFailure('fixture_provider_deadline'), 'deadline'),
+                 (ProofFailure('fixture_output_bound'), 'bound'),
+                 (ProofFailure('fixture_stderr_bound'), 'bound'),
+                 (ProofFailure('fixture_pending_bound'), 'bound'),
+                 (ProofFailure('fixture_provider_exited'), 'provider_exit'),
+                 (ProofFailure('process_inspection_unavailable'), 'ownership_unverified'),
+                 (ValueError('private malformed JSON'), 'malformed_result'),
+                 (BrokenPipeError('private transport'), 'transport_error'),
+                 (RuntimeError('private unexpected'), 'transport_error')]
+        for response, outcome in cases:
+            with self.subTest(outcome=outcome):
+                status, report, provider, _ = self.diagnostic_fixture([{'exitCode': 1}, response])
+                self.assertEqual(status, 1)
+                self.assertEqual(report['diagnostic'], 'fixture_tool_failed_null')
+                self.assertEqual(provider.request.call_count, 2)
+                self.assertEqual(report['runtime_diagnostics']['true']['outcome'], outcome)
+                self.assertEqual(report['runtime_diagnostics']['python_startup']['outcome'], 'not_run')
+                self.assertNotIn('private', json.dumps(report))
+                provider.close.assert_called_once()
+        for malformed in (None, [], {}, {'exitCode': True}, {'exitCode': 2 ** 31}):
+            with self.subTest(original=malformed):
+                status, report, provider, _ = self.diagnostic_fixture([malformed])
+                self.assertEqual(status, 1)
+                self.assertEqual(provider.request.call_count, 1)
+                self.assertNotIn('runtime_diagnostics', report)
+                provider.close.assert_called_once()
+
+    def test_runtime_diagnostics_budget_inspection_and_provider_exit_stop_before_request(self):
+        original = {'exitCode': 1}
+        for failure, outcome in [(ProofFailure('process_inspection_unavailable'), 'ownership_unverified'),
+                                 (None, 'provider_exit')]:
+            provider = mock.Mock()
+            provider.child.poll.return_value = 1
+            with mock.patch(__name__ + '.observe_owned', side_effect=failure):
+                detail = diagnose_provider_runtime(provider, Path('/unused'), '/python', original)
+            self.assertEqual(detail['true']['outcome'], outcome)
+            provider.request.assert_not_called()
+        provider = mock.Mock()
+        provider.child.poll.return_value = None
+        provider.response.return_value = {'exitCode': 0}
+        # Account for the ownership check before starting each response deadline.
+        with mock.patch(__name__ + '.observe_owned'), mock.patch(
+                __name__ + '.time.monotonic', side_effect=[0, 0, 0, 0, 31, 65]):
+            detail = diagnose_provider_runtime(provider, Path('/unused'), '/python', original)
+        self.assertEqual(provider.request.call_count, 1)
+        self.assertEqual(detail['python_startup']['outcome'], 'deadline')
+        self.assertEqual(provider.response.call_args.kwargs['timeout'], 30)
+
+    def test_runtime_diagnostics_budget_accounts_for_request_send_time(self):
+        provider = mock.Mock()
+        provider.child.poll.return_value = None
+        provider.response.return_value = {'exitCode': 0}
+        with mock.patch(__name__ + '.observe_owned'), mock.patch(
+                __name__ + '.time.monotonic', side_effect=[0, 0, 0, 60, 64, 65]):
+            detail = diagnose_provider_runtime(provider, Path('/unused'), '/python', {'exitCode': 1})
+        self.assertEqual(provider.request.call_count, 1)
+        self.assertEqual(provider.response.call_args.kwargs['timeout'], 5)
+        self.assertEqual(detail['python_startup']['outcome'], 'deadline')
+
+    def test_runtime_diagnostics_python_marker_is_exact_and_cleanup_stays_uncertain(self):
+        for code, stdout, started in [(0, 'HERDR_DIAG_PYTHON_STARTED\n', True),
+                                      (1, 'HERDR_DIAG_PYTHON_STARTED\n', False),
+                                      (0, 'HERDR_DIAG_PYTHON_STARTED\nprivate', False),
+                                      (0, 'HERDR_DIAG_PYTHON_STARTED', False)]:
+            status, report, provider, root = self.diagnostic_fixture([
+                {'exitCode': 1}, {'exitCode': 1}, {'exitCode': code, 'stdout': stdout}], cleanup_error=True)
+            self.assertEqual(status, 1)
+            self.assertEqual(report['runtime_diagnostics']['python_started'], started)
+            self.assertEqual(report['owned_cleanup'], 'UNVERIFIED')
+            self.assertEqual(report['diagnostic'], 'fixture_tool_failed_null')
+            self.assertTrue(root.exists())
+            provider.close.assert_called_once()
+
+    def test_runtime_diagnostics_workflow_enables_only_linux(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/integrated-agents.yml').read_text()
+        code = workflow.split("python3 - <<'PY'\n", 1)[1].rsplit('\n          PY', 1)[0]
+        import textwrap
+        for platform in ('Linux', 'Darwin'):
+            calls = []
+            with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(os.environ, {'RUNNER_TEMP': temporary}), mock.patch(
+                    'pathlib.Path.glob', return_value=[Path('/native/codex')]), mock.patch(
+                    'subprocess.run', side_effect=lambda argv, **kwargs: calls.append(argv) or mock.Mock(returncode=0)), mock.patch(
+                    'os.uname', return_value=mock.Mock(sysname=platform)):
+                exec(textwrap.dedent(code), {})
+            self.assertEqual(len(calls), 2)
+            for argv in calls:
+                self.assertEqual('--diagnose-provider-runtime' in argv, platform == 'Linux')
+                self.assertIn('--provider-fixtures-only', argv)
+
     def closing_provider(self, provider_type=DirectProvider):
         provider = object.__new__(provider_type)
         provider.closed = False
@@ -1088,12 +1437,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--strict-test-policy', action='store_true', help='user-approved disposable-only on-request/manual consent; never changes saved settings or sandbox policy')
     parser.add_argument('--provider-fixtures-only', action='store_true', help='opt-in shipped-binary tool/hook/MCP descriptor fixtures; no model calls')
+    parser.add_argument('--diagnose-provider-runtime', action='store_true', help='Linux provider-fixtures-only: two bounded supplemental probes after a failed null control')
     parser.add_argument('--session', required=True, help='new codex-proof-<32 random hex> session')
     parser.add_argument('--scratch', required=True, type=Path, help='nonexistent canonical absolute /.../herdr-codex-<same hex>')
     parser.add_argument('--consent-scratch', type=Path, help='optional distinct fresh herdr-codex-<same hex> directory outside normal writable roots for approval exercises')
     parser.add_argument('--provider-path', required=True, type=Path, help='absolute existing Codex 0.154.0 executable; never auto-installs')
     parser.add_argument('--herdr-bin', required=True, type=Path, help='absolute freshly built Herdr executable')
     args = parser.parse_args()
+    if args.diagnose_provider_runtime and (not args.provider_fixtures_only or os.sys.platform != 'linux'):
+        parser.error('--diagnose-provider-runtime requires --provider-fixtures-only on Linux')
     try:
         return provider_fixtures(args) if args.provider_fixtures_only else live(args)
     except (ProofFailure, subprocess.TimeoutExpired) as error:
