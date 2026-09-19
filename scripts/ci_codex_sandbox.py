@@ -774,29 +774,52 @@ class CandidateScratch:
         shutil.rmtree(self.path)
 
 
+def candidate_alias_directory(path, uid, *, private=False):
+    st = path.lstat()
+    require(stat.S_ISDIR(st.st_mode) and st.st_uid == uid and
+            not st.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID),
+            'candidate_alias_unverified')
+    if private:
+        require(stat.S_IMODE(st.st_mode) == 0o700, 'candidate_alias_unverified')
+
+
 def candidate_alias(root):
     """Metadata only, once after initialization while the provider is alive."""
+    # The task-owned scratch keeps its exact mode; provider metadata has its own
+    # contract and must not be reported as scratch replacement.
+    uid = os.getuid()
+    try:
+        candidate_directory(root, uid, scratch=True)
+    except (Refused, OSError):
+        raise Refused('candidate_scratch_changed') from None
     source, _ = resource()
     native = source.parent.parent / 'bin/codex'
-    require(native.resolve(strict=True) == native and native.is_file() and os.access(native, os.X_OK),
-            'candidate_alias_unverified')
-    directory = root / 'codex-home/tmp/arg0'
-    require(directory.resolve(strict=True) == directory, 'candidate_alias_unverified')
-    # One live provider at a time. Bound enumeration; never scan inherited HOME.
-    with os.scandir(directory) as entries:
-        children = []
-        for entry in entries:
-            require(len(children) < 16, 'candidate_alias_unverified')
-            children.append(Path(entry.path))
-    aliases = []
-    for child in children:
-        if child.name.startswith('codex-arg0'):
-            candidate_directory(child, os.getuid(), scratch=True)
-            alias = child / 'codex-linux-sandbox'
-            require(alias.is_symlink() and alias.resolve(strict=True) == native,
-                    'candidate_alias_unverified')
-            aliases.append(alias)
-    require(len(aliases) == 1, 'candidate_alias_unverified')
+    try:
+        require(native.resolve(strict=True) == native and native.is_file() and os.access(native, os.X_OK),
+                'candidate_alias_unverified')
+        home = root / 'codex-home'
+        directory = home / 'tmp/arg0'
+        require(directory.resolve(strict=True) == directory, 'candidate_alias_unverified')
+        for parent in (home, home / 'tmp', directory):
+            candidate_alias_directory(parent, uid, private=parent == directory)
+        # One live provider at a time. Bound enumeration; never scan inherited HOME.
+        with os.scandir(directory) as entries:
+            children = []
+            for entry in entries:
+                require(len(children) < 16, 'candidate_alias_unverified')
+                children.append(Path(entry.path))
+        aliases = []
+        for child in children:
+            if child.name.startswith('codex-arg0'):
+                # Codex makes arg0 private, but tempfile's child mode follows umask.
+                candidate_alias_directory(child, uid)
+                alias = child / 'codex-linux-sandbox'
+                require(alias.is_symlink() and alias.resolve(strict=True) == native,
+                        'candidate_alias_unverified')
+                aliases.append(alias)
+        require(len(aliases) == 1, 'candidate_alias_unverified')
+    except (OSError, RuntimeError):
+        raise Refused('candidate_alias_unverified') from None
 
 
 def fixtures(stage):

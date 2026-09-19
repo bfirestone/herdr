@@ -387,8 +387,16 @@ succeeds. Only the created child is removed, including provider arg0 and SQLite
 descendants. The separate denial canary remains a canonical HOME sibling outside
 all writable roots. A bounded metadata-only observation after existing provider
 initialization requires one provider-created `codex-linux-sandbox` symlink in
-owned CODEX_HOME to resolve to the pinned package's native executable. This
-creates no aliases and makes no extra RPC, read, wait or retry. Public
+owned CODEX_HOME to resolve to the pinned package's native executable. Source6
+requires real runner-owned codex-home/tmp/arg0 directories and a real runner-owned
+session child, all without group/other writes or set-id modes. The arg0 ancestor
+must be exactly 0700; safe 0700 or 0755 session children are accepted beneath it.
+Pinned Codex explicitly makes arg0 private but does not promise a 0700 session
+child. Earlier CI reported `candidate_scratch_changed` during initialization;
+its actual child mode was not observed. Alias metadata failures now report
+`candidate_alias_unverified`, while the task-owned scratch retains its exact
+0700 and captured identity requirements. This observation creates no aliases
+and makes no extra RPC, read, wait or retry. Public
 `candidate_paths` contains only safe-parent, outside-temp and alias booleans.
 Actual Ubuntu parent metadata and successful native/npm aliases and PTY execution
 still require the next exact-commit CI run.

@@ -223,6 +223,7 @@ class CandidateHomeTests(unittest.TestCase):
             native.chmod(0o755)
             directory = host.scratch / 'codex-home/tmp/arg0/codex-arg0owned'
             directory.mkdir(parents=True, mode=0o700)
+            directory.parent.chmod(0o700)
             alias = directory / 'codex-linux-sandbox'
             with mock.patch.object(sandbox, 'resource', return_value=(source, b'')):
                 with self.assertRaises(sandbox.Refused):
@@ -298,6 +299,180 @@ class CandidateHomeTests(unittest.TestCase):
                         sandbox.fixtures('candidate')
                     self.assertEqual(snapshots, [[False, False], [True, False]])
 
+class CandidateAliasTests(unittest.TestCase):
+    """Real metadata below scratch: no substituted ancestor permissions."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.root = self.base / 'scratch'
+        self.root.mkdir(mode=0o700)
+        self.home = self.root / 'codex-home'
+        self.home.mkdir(mode=0o755)
+        self.tmp = self.home / 'tmp'
+        self.tmp.mkdir(mode=0o755)
+        self.arg0 = self.tmp / 'arg0'
+        self.arg0.mkdir(mode=0o700)
+        self.child = self.arg0 / 'codex-arg0owned'
+        self.child.mkdir(mode=0o700)
+        source = self.base / 'provider/codex-resources/bwrap'
+        source.parent.mkdir(parents=True)
+        self.native = source.parent.parent / 'bin/codex'
+        self.native.parent.mkdir()
+        self.native.write_text('pinned executable fixture')
+        self.native.chmod(0o755)
+        self.alias = self.child / 'codex-linux-sandbox'
+        self.alias.symlink_to(self.native)
+        patch = mock.patch.object(sandbox, 'resource', return_value=(source, b''))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def assert_alias_refused(self):
+        with self.assertRaisesRegex(sandbox.Refused, '^candidate_alias_unverified$') as caught:
+            sandbox.candidate_alias(self.root)
+        self.assertEqual(sandbox.failure_category(caught.exception), 'candidate_alias_unverified')
+        report = sandbox.safe_fixture_report({'diagnostic': str(caught.exception),
+                                             'candidate_failure': {'diagnostic': str(caught.exception)}})
+        self.assertEqual(report['diagnostic'], 'candidate_alias_unverified')
+        self.assertEqual(report['candidate_failure']['diagnostic'], 'candidate_alias_unverified')
+
+    def test_private_arg0_accepts_safe_provider_child_modes_without_mutation(self):
+        for mode in (0o700, 0o755):
+            with self.subTest(mode=mode):
+                self.child.chmod(mode)
+                before = {path: path.lstat() for path in (self.root, self.home, self.tmp, self.arg0, self.child, self.alias)}
+                with mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('content read')), mock.patch.object(
+                        Path, 'chmod', side_effect=AssertionError('mode repair')), mock.patch.object(
+                        Path, 'symlink_to', side_effect=AssertionError('alias creation')), mock.patch.object(
+                        subprocess, 'run', side_effect=AssertionError('provider invocation')):
+                    sandbox.candidate_alias(self.root)
+                self.assertEqual(before, {path: path.lstat() for path in before})
+
+    def test_arg0_must_remain_exactly_private(self):
+        for mode in (0o750, 0o755):
+            with self.subTest(mode=mode):
+                self.arg0.chmod(mode)
+                self.assert_alias_refused()
+
+    def test_all_provider_directories_reject_writable_modes(self):
+        for path in (self.home, self.tmp, self.arg0, self.child):
+            original = stat.S_IMODE(path.lstat().st_mode)
+            for mode in (0o702, 0o720, 0o775, 0o777):
+                with self.subTest(part=path.name, mode=mode):
+                    path.chmod(mode)
+                    self.assertEqual(stat.S_IMODE(path.lstat().st_mode), mode)
+                    self.assert_alias_refused()
+            path.chmod(original)
+
+    def test_all_provider_directories_reject_setid_metadata(self):
+        # macOS may strip directory set-id bits on chmod. Inject only the unsafe
+        # bits into otherwise real metadata so every refusal is exercised.
+        lstat = Path.lstat
+        for directory in (self.home, self.tmp, self.arg0, self.child):
+            for bit in (stat.S_ISUID, stat.S_ISGID):
+                def metadata(path):
+                    st = lstat(path)
+                    return SimpleNamespace(st_mode=st.st_mode | bit, st_uid=st.st_uid) if path == directory else st
+                with self.subTest(part=directory.name, bit=bit), mock.patch.object(Path, 'lstat', metadata):
+                    self.assertTrue(directory.lstat().st_mode & bit)
+                    self.assert_alias_refused()
+
+    def test_all_provider_directories_require_runner_owner_including_root_refusal(self):
+        lstat = Path.lstat
+        for directory in (self.home, self.tmp, self.arg0, self.child):
+            for owner in {0, os.getuid() + 123} - {os.getuid()}:
+                def metadata(path):
+                    st = lstat(path)
+                    return SimpleNamespace(st_mode=st.st_mode, st_uid=owner) if path == directory else st
+                with self.subTest(part=directory.name, owner=owner), mock.patch.object(Path, 'lstat', metadata):
+                    self.assert_alias_refused()
+
+    def test_symlinked_provider_chain_is_refused(self):
+        for directory in (self.child, self.arg0, self.tmp, self.home):
+            with self.subTest(part=directory.name):
+                moved = self.base / ('saved-' + directory.name)
+                directory.rename(moved)
+                try:
+                    directory.symlink_to(moved, target_is_directory=True)
+                    self.assert_alias_refused()
+                finally:
+                    directory.unlink()
+                    moved.rename(directory)
+
+    def test_missing_nondirectory_and_inaccessible_metadata_use_alias_category(self):
+        for directory in (self.child, self.arg0, self.tmp, self.home):
+            with self.subTest(part=directory.name):
+                moved = self.base / ('saved-' + directory.name)
+                directory.rename(moved)
+                try:
+                    self.assert_alias_refused()
+                    directory.write_text('not a directory')
+                    self.assert_alias_refused()
+                finally:
+                    if directory.exists():
+                        directory.unlink()
+                    moved.rename(directory)
+        lstat = Path.lstat
+        def inaccessible(path):
+            if path == self.child:
+                raise PermissionError('private path must not escape')
+            return lstat(path)
+        with mock.patch.object(Path, 'lstat', inaccessible):
+            self.assert_alias_refused()
+
+    def test_wrong_missing_regular_dangling_and_looping_aliases_are_refused(self):
+        self.alias.unlink()
+        self.assert_alias_refused()
+        self.alias.write_text('not a symlink')
+        self.assert_alias_refused()
+        self.alias.unlink()
+        other = self.base / 'other'
+        other.write_text('unrelated executable')
+        for target in (other, self.base / 'missing', self.alias):
+            self.alias.symlink_to(target)
+            self.assert_alias_refused()
+            self.alias.unlink()
+
+    def test_ambiguous_live_aliases_are_refused(self):
+        other = self.arg0 / 'codex-arg0second'
+        other.mkdir(mode=0o755)
+        (other / self.alias.name).symlink_to(self.native)
+        self.assert_alias_refused()
+
+    def test_directory_enumeration_keeps_the_existing_bound(self):
+        for index in range(15):
+            (self.arg0 / ('unrelated-' + str(index))).mkdir()
+        sandbox.candidate_alias(self.root)
+        (self.arg0 / 'one-too-many').mkdir()
+        self.assert_alias_refused()
+
+    def test_native_target_must_remain_canonical_regular_and_executable(self):
+        self.native.chmod(0o644)
+        self.assert_alias_refused()
+        self.native.unlink()
+        self.native.mkdir()
+        self.assert_alias_refused()
+        self.native.rmdir()
+        other = self.base / 'other'
+        other.write_text('not the canonical target')
+        other.chmod(0o755)
+        self.native.symlink_to(other)
+        self.assert_alias_refused()
+
+    def test_actual_scratch_0755_remains_a_scratch_failure(self):
+        self.root.chmod(0o755)
+        with self.assertRaisesRegex(sandbox.Refused, '^candidate_scratch_changed$'):
+            sandbox.candidate_alias(self.root)
+        with self.assertRaisesRegex(sandbox.Refused, '^candidate_scratch_changed$'):
+            sandbox.candidate_directory(self.root, os.getuid(), scratch=True)
+        with SimulatedCandidateHome() as host:
+            guard = sandbox.CandidateScratch(host.scratch)
+            guard.create()
+            host.scratch.chmod(0o755)
+            with mock.patch.object(sandbox.shutil, 'rmtree') as remove, self.assertRaisesRegex(
+                    sandbox.Refused, '^candidate_scratch_changed$'):
+                guard.remove()
+            remove.assert_not_called()
 
 
 class SimulatedLinux:
