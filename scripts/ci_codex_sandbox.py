@@ -25,7 +25,7 @@ RESOURCE_SIZE = 529776
 REGISTRY_INTEGRITY = 'sha512-a4FI3A8sGtwGrOqltrPbrS2hajrHQG591EwmRfiRoLMb10VxdBtUGW4gu6IJVYENiYGA7k3P4jlRHEoCZU/s9Q=='
 PROFILE_HASH = '11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9'
 PACKAGE_VERSION = '4.0.1really4.0.1-0ubuntu0.24.04.7'
-RUNTIME_PARENT = Path('/opt/herdr-codex-runtime')
+RUNTIME_PARENT = Path('/var/lib/herdr-codex-runtime')
 RUNTIME = RUNTIME_PARENT / VERSION
 BWRAP = RUNTIME / 'bwrap'
 PROFILE = Path('/etc/apparmor.d/herdr-codex-bwrap-0154')
@@ -248,9 +248,14 @@ def preflight():
     uid = target(root=True)
     for path in (RUNTIME, PROFILE, STATE, fixture_status_path()):
         require(not path.exists() and not path.is_symlink(), 'owned_path_collision')
-    chain(RUNTIME_PARENT if RUNTIME_PARENT.exists() else RUNTIME_PARENT.parent)
-    chain(PROFILE.parent)
-    chain(STATE.parent)
+    for path, category in (
+            (RUNTIME_PARENT if RUNTIME_PARENT.exists() else RUNTIME_PARENT.parent, 'preflight_runtime_parent_chain'),
+            (PROFILE.parent, 'preflight_profile_parent_chain'),
+            (STATE.parent, 'preflight_state_parent_chain')):
+        try:
+            chain(path)
+        except (Refused, OSError):
+            raise Refused(category) from None
     no_customization()
     require(Path(PARSER).is_file() and os.access(PARSER, os.X_OK), 'parser_unavailable')
     for name in ('abi/4.0', 'tunables/global'):
@@ -261,9 +266,13 @@ def preflight():
     require(len(observed) == len(original), 'attachment_inventory_uncertain')
     require(not any(name in ('bwrap', 'unpriv_bwrap') or attachment_may_match(attach)
                     for name, attach in observed), 'attachment_collision')
-    source, data = resource()
+    try:
+        source, data = resource()
+        source_identity = identity(source, root=False)
+    except (Refused, OSError, ValueError, KeyError):
+        raise Refused('preflight_provider_resource') from None
     return {'schema': 1, 'uid': uid, 'restrictions': restrictions(), 'profiles': original,
-            'source_identity': identity(source, root=False), 'source_hash': digest(data),
+            'source_identity': source_identity, 'source_hash': digest(data),
             'parents': {}, 'files': {}, 'load_attempted': False, 'load_observed': False,
             'loaded': [], 'phase': 'registered'}
 
@@ -549,7 +558,7 @@ def fixtures(stage):
             'baseline_lsm_attribution': 'unknown'}
 
 
-FAILURE_CATEGORIES = frozenset(('fixture_status_parent_uncertain', 'fixture_status_owner')) | frozenset(('profile_parse_failed', 'profile_add_failed', 'profile_remove_failed', 'profile_download_failed', 'profile_extract_failed')) | frozenset(('attachment_collision', 'attachment_inventory_unavailable', 'attachment_inventory_uncertain', 'candidate_fixtures_failed', 'candidate_hash_mismatch', 'cleanup_archive_changed', 'cleanup_attachment_changed', 'cleanup_file_changed', 'cleanup_parent_changed', 'cleanup_paths_not_restored', 'cleanup_profile_changed', 'cleanup_profile_drift', 'cleanup_profiles_not_restored', 'cleanup_unknown_debris', 'cleanup_unowned_file', 'cleanup_unowned_profile', 'file_capability', 'fixture_cleanup_unverified', 'fixture_report_malformed', 'incompatible_restrictions', 'journal_identity_mismatch', 'journal_schema_mismatch', 'loaded_profile_drift', 'mandatory_restriction_missing', 'operation_failed', 'owned_attachment_changed', 'owned_binary_changed', 'owned_parent_changed', 'owned_path_collision', 'owned_profile_changed', 'parser_unavailable', 'preload_profile_drift', 'profile_archive_count', 'profile_collision', 'profile_customization_present', 'profile_include_unavailable', 'profile_inventory_uncertain', 'profile_member_mismatch', 'profile_package_mismatch', 'profile_source_mismatch', 'provider_identity_changed', 'provider_native_count', 'provider_package_mismatch', 'provider_path_uncertain', 'provider_resource_count', 'provider_resource_mismatch', 'restriction_drift', 'restrictions_disabled', 'setup_missing', 'unknown_restriction', 'unsafe_file_mode', 'unsafe_file_owner', 'unsafe_file_type', 'wrong_ci_target', 'wrong_fixture_user', 'wrong_target'))
+FAILURE_CATEGORIES = frozenset(('preflight_runtime_parent_chain', 'preflight_profile_parent_chain', 'preflight_state_parent_chain', 'preflight_provider_resource')) | frozenset(('fixture_status_parent_uncertain', 'fixture_status_owner')) | frozenset(('profile_parse_failed', 'profile_add_failed', 'profile_remove_failed', 'profile_download_failed', 'profile_extract_failed')) | frozenset(('attachment_collision', 'attachment_inventory_unavailable', 'attachment_inventory_uncertain', 'candidate_fixtures_failed', 'candidate_hash_mismatch', 'cleanup_archive_changed', 'cleanup_attachment_changed', 'cleanup_file_changed', 'cleanup_parent_changed', 'cleanup_paths_not_restored', 'cleanup_profile_changed', 'cleanup_profile_drift', 'cleanup_profiles_not_restored', 'cleanup_unknown_debris', 'cleanup_unowned_file', 'cleanup_unowned_profile', 'file_capability', 'fixture_cleanup_unverified', 'fixture_report_malformed', 'incompatible_restrictions', 'journal_identity_mismatch', 'journal_schema_mismatch', 'loaded_profile_drift', 'mandatory_restriction_missing', 'operation_failed', 'owned_attachment_changed', 'owned_binary_changed', 'owned_parent_changed', 'owned_path_collision', 'owned_profile_changed', 'parser_unavailable', 'preload_profile_drift', 'profile_archive_count', 'profile_collision', 'profile_customization_present', 'profile_include_unavailable', 'profile_inventory_uncertain', 'profile_member_mismatch', 'profile_package_mismatch', 'profile_source_mismatch', 'provider_identity_changed', 'provider_native_count', 'provider_package_mismatch', 'provider_path_uncertain', 'provider_resource_count', 'provider_resource_mismatch', 'restriction_drift', 'restrictions_disabled', 'setup_missing', 'unknown_restriction', 'unsafe_file_mode', 'unsafe_file_owner', 'unsafe_file_type', 'wrong_ci_target', 'wrong_fixture_user', 'wrong_target'))
 
 
 def main():

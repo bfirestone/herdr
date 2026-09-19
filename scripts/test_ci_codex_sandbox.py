@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -30,11 +31,11 @@ class SimulatedLinux:
         self.source.write_bytes(b'simulated pinned resource')
         self.source.chmod(0o755)
         self.patch = lambda name, value: self.stack.enter_context(mock.patch.object(sandbox, name, value))
-        for name, relative in [('RUNTIME_PARENT', 'opt/herdr-codex-runtime'), ('RUNTIME', 'opt/herdr-codex-runtime/0.154.0'),
-                               ('BWRAP', 'opt/herdr-codex-runtime/0.154.0/bwrap'), ('PROFILE', 'etc/apparmor.d/herdr-codex-bwrap-0154'),
+        for name, relative in [('RUNTIME_PARENT', 'var/lib/herdr-codex-runtime'), ('RUNTIME', 'var/lib/herdr-codex-runtime/0.154.0'),
+                               ('BWRAP', 'var/lib/herdr-codex-runtime/0.154.0/bwrap'), ('PROFILE', 'etc/apparmor.d/herdr-codex-bwrap-0154'),
                                ('STATE', 'run/herdr-codex-runtime-0154'), ('JOURNAL', 'run/herdr-codex-runtime-0154/journal.json')]:
             self.patch(name, self.root / relative)
-        for directory in (self.root / 'opt', sandbox.PROFILE.parent, sandbox.STATE.parent):
+        for directory in (self.root / 'var/lib', sandbox.PROFILE.parent, sandbox.STATE.parent):
             directory.mkdir(parents=True)
         for relative in ('abi/4.0', 'tunables/global'):
             path = sandbox.PROFILE.parent / relative
@@ -108,7 +109,7 @@ class SandboxTests(unittest.TestCase):
     def test_attachment_overlap_is_conservative_and_disjoint_paths_are_allowed(self):
         for pattern in ('/usr/{bin,lib}/**', '/snap/**', '/opt/google/chrome/**', 'unrelated', '/usr/bin/bwrap'):
             self.assertFalse(sandbox.attachment_may_match(pattern), pattern)
-        for pattern in (str(sandbox.BWRAP), '/opt/**', '/{usr,opt}/**', '/**', '<unknown>', '@{VAR}/bwrap', '', '/opt/herdr-*/**'):
+        for pattern in (str(sandbox.BWRAP), '/var/**', '/{usr,var}/**', '/**', '<unknown>', '@{VAR}/bwrap', '', '/var/lib/herdr-*/**'):
             self.assertTrue(sandbox.attachment_may_match(pattern), pattern)
 
     def test_wrong_target_is_refused_before_any_mutation(self):
@@ -139,9 +140,68 @@ class SandboxTests(unittest.TestCase):
             with self.assertRaisesRegex(sandbox.Refused, 'owned_path_collision'):
                 sandbox.preflight()
 
+    def test_fixed_runtime_avoids_writable_opt_and_checks_full_var_lib_chain(self):
+        self.assertEqual(sandbox.BWRAP, Path('/var/lib/herdr-codex-runtime/0.154.0/bwrap'))
+        real_identity = sandbox.identity
+        real_lstat = Path.lstat
+        with SimulatedLinux() as host:
+            checked = []
+            opt = host.root / 'opt'
+            opt.mkdir(mode=0o777)
+            opt.chmod(0o777)  # Scratch fixture only; reproduce the hosted image.
+            def rooted_identity(path, **kwargs):
+                checked.append(path)
+                actual = real_lstat(path)
+                # Model root ownership throughout the virtual Linux filesystem,
+                # retaining scratch modes and exercising the real identity guard.
+                mode = actual.st_mode if path.is_relative_to(host.root) else stat.S_IFDIR | 0o755
+                metadata = SimpleNamespace(st_dev=actual.st_dev, st_ino=actual.st_ino,
+                                           st_uid=0, st_mode=mode)
+                with mock.patch.object(Path, 'lstat', return_value=metadata):
+                    return real_identity(path, **kwargs)
+            with mock.patch.object(sandbox, 'identity', side_effect=rooted_identity):
+                with mock.patch.object(sandbox, 'RUNTIME_PARENT', opt / 'herdr-codex-runtime'):
+                    with self.assertRaisesRegex(sandbox.Refused, '^preflight_runtime_parent_chain$'):
+                        sandbox.preflight()
+                self.assertIn(opt, checked)
+                checked.clear()
+                self.assertEqual(sandbox.preflight()['phase'], 'registered')
+                for parent in (sandbox.RUNTIME_PARENT.parent, *sandbox.RUNTIME_PARENT.parent.parents):
+                    self.assertIn(parent, checked)
+                # A writable intermediate ancestor still refuses the new path.
+                (host.root / 'var').chmod(0o777)
+                with self.assertRaisesRegex(sandbox.Refused, '^preflight_runtime_parent_chain$'):
+                    sandbox.preflight()
+            self.assertEqual(stat.S_IMODE(opt.stat().st_mode), 0o777)
+            self.assertFalse(sandbox.STATE.exists())
+            self.assertFalse(sandbox.RUNTIME_PARENT.exists())
+            self.assertEqual(host.commands, [])
+
+    def test_preflight_guard_failures_have_fixed_redacted_categories(self):
+        for guard in ('runtime_parent_chain', 'profile_parent_chain', 'state_parent_chain', 'provider_resource'):
+            for error in (sandbox.Refused('unsafe_file_owner'), OSError('private-path uid=123 mode=777')):
+                with self.subTest(guard=guard, error=type(error).__name__), SimulatedLinux() as host:
+                    real_chain = sandbox.chain
+                    paths = {'runtime_parent_chain': sandbox.RUNTIME_PARENT.parent,
+                             'profile_parent_chain': sandbox.PROFILE.parent,
+                             'state_parent_chain': sandbox.STATE.parent}
+                    def chain(path):
+                        if path == paths.get(guard):
+                            raise error
+                        return real_chain(path)
+                    resource = mock.Mock(side_effect=error) if guard == 'provider_resource' else sandbox.resource
+                    with mock.patch.object(sandbox, 'chain', side_effect=chain), mock.patch.object(
+                            sandbox, 'resource', resource), mock.patch('sys.argv', ['helper', 'plan']), redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(sandbox.main(), 1)
+                    self.assertEqual(json.loads(output.getvalue()),
+                                     {'mode': 'plan', 'result': 'FAIL', 'diagnostic': 'preflight_' + guard})
+                    self.assertFalse(sandbox.STATE.exists())
+                    self.assertFalse(sandbox.RUNTIME_PARENT.exists())
+                    self.assertEqual(host.commands, [])
+
     def test_profile_collision_and_ambiguous_attachment_stop_preflight(self):
         for loaded, attached in [(['bwrap (complain)'], [('bwrap', str(sandbox.BWRAP))]),
-                                 (['other (enforce)'], [('other', '/opt/**')])]:
+                                 (['other (enforce)'], [('other', '/var/**')])]:
             with SimulatedLinux(), mock.patch.object(sandbox, 'profiles', return_value=loaded), mock.patch.object(
                     sandbox, 'attachments', return_value=attached) as observation:
                 if loaded == ['other (enforce)']:

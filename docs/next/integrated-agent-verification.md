@@ -219,7 +219,7 @@ observations are recorded separately; an expected baseline failure is never
 candidate success. macOS retains its original fixture path.
 
 The candidate copies the already installed pinned package's exact bwrap bytes to
-`/opt/herdr-codex-runtime/0.154.0/bwrap`. The expected resource size is 529,776
+`/var/lib/herdr-codex-runtime/0.154.0/bwrap`. The expected resource size is 529,776
 bytes and SHA-256 is
 `01fb705f067bd5365b63d8ad2323a61c8d007733ca5e649437e086f3fb9935d8`.
 This value was independently derived from the npm platform tarball after checking
@@ -240,9 +240,19 @@ child stacking and `audit deny capability` stay intact. Lowercase `px` does not
 by itself establish environment sanitization. The distro bubblewrap package is
 neither installed nor substituted.
 
+The fixed staging path moved from `/opt` after run
+[35420167666](https://github.com/bfirestone/herdr/actions/runs/35420167666)
+refused unsafe ownership during read-only preflight, before apply. The hosted
+Ubuntu image's setup makes `/opt` writable. The new `/var/lib` chain must pass
+the same ownership checks on the actual runner; no preexisting directory is
+chmodded or chowned to make setup succeed. This path correction alone does not
+qualify Linux or exact Send.
+
 Preflight checks existing ABI/include support, scalar restrictions, root-owned
 nonwritable parent chains, absent owned files/profiles, and absent optional local
-profile customizations. It inventories loaded attachment expressions and proves
+profile customizations. Failed runtime, profile and state parent-chain checks,
+and provider-resource checks, emit distinct fixed `preflight_*` categories;
+paths, ownership metadata and raw exception text are not emitted. It inventories loaded attachment expressions and proves
 non-overlap using literal prefixes and bounded finite brace alternatives;
 ambiguous expressions fail closed. Kernel `attach` output of `<unknown>` is
 ambiguous, while an unattached profile reports its plain name. See the
