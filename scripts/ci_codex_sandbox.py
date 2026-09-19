@@ -664,6 +664,9 @@ def safe_fixture_report(report):
                 'python_started', 'nonroot', 'outside_write_denied', 'loopback_connect_denied',
                 'parent_write_control', 'parent_connect_control', 'canary_unchanged', 'parent_listener_unreached')
         result['linux_enforcement'] = {key: enforcement.get(key) is True for key in keys}
+    if 'candidate_paths' in report:
+        paths = report['candidate_paths'] if isinstance(report['candidate_paths'], dict) else {}
+        result['candidate_paths'] = {key: paths.get(key) is True for key in ('safe_parent', 'outside_temp', 'provider_alias')}
     detail = report.get('runtime_diagnostics')
     if isinstance(detail, dict):
         clean = {'python_started': detail.get('python_started') is True}
@@ -679,6 +682,123 @@ def safe_fixture_report(report):
     return result
 
 
+# Candidate-only filesystem checks. These never repair or read inherited homes.
+CANDIDATE_PATH_DIAGNOSTICS = frozenset({
+    'candidate_home_invalid', 'candidate_temp_invalid', 'candidate_home_unsafe',
+    'candidate_temp_overlap', 'candidate_project_marker', 'candidate_parent_changed',
+    'candidate_scratch_changed', 'candidate_alias_unverified',
+})
+
+
+def candidate_directory(path, uid, *, scratch=False):
+    st = path.lstat()
+    require(stat.S_ISDIR(st.st_mode) and st.st_uid in (0, uid) and
+            not st.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID), 'candidate_home_unsafe')
+    if scratch:
+        require(st.st_uid == uid and stat.S_IMODE(st.st_mode) == 0o700, 'candidate_scratch_changed')
+    return (st.st_dev, st.st_ino, st.st_uid, stat.S_IMODE(st.st_mode))
+
+
+def candidate_canonical(value, category):
+    require(isinstance(value, str) and value and Path(value).is_absolute() and
+            '..' not in Path(value).parts, category)
+    path = Path(value)
+    try:
+        require(path.resolve(strict=True) == path and path.is_dir(), category)
+        for parent in (path, *path.parents):
+            require(stat.S_ISDIR(parent.lstat().st_mode), category)
+    except (OSError, RuntimeError):
+        raise Refused(category) from None
+    return path
+
+
+def candidate_temp_roots():
+    # Rust Unix std::env::temp_dir uses TMPDIR when present, otherwise /tmp.
+    # Python tempfile has different probing/fallback and TEMP/TMP semantics.
+    temporary = candidate_canonical(os.environ.get('TMPDIR', '/tmp'), 'candidate_temp_invalid')
+    return (temporary, Path('/tmp').resolve(strict=True))
+
+
+def candidate_outside(path, roots):
+    return all(path != root and root not in path.parents for root in roots)
+
+
+def candidate_parent():
+    uid = target()
+    home = candidate_canonical(os.environ.get('HOME'), 'candidate_home_invalid')
+    require(home != Path('/') and Path.home() == home, 'candidate_home_invalid')
+    roots = candidate_temp_roots()
+    require(candidate_outside(home, roots), 'candidate_temp_overlap')
+    parents = {}
+    for parent in reversed((home, *home.parents)):
+        parents[parent] = candidate_directory(parent, uid)
+        # Metadata only; inaccessible markers are uncertainty, not absence.
+        try:
+            (parent / '.git').lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise Refused('candidate_project_marker') from None
+        else:
+            raise Refused('candidate_project_marker')
+    require(parents[home][2] == uid, 'candidate_home_unsafe')
+    return home, parents
+
+
+class CandidateScratch:
+    """One fresh runner-home child; retained identities guard creation/removal."""
+    def __init__(self, path):
+        self.home, self.parents = candidate_parent()
+        self.path = path
+        self.created = None
+        require(path.parent == self.home and candidate_outside(path, candidate_temp_roots()),
+                'candidate_temp_overlap')
+        require(not os.path.lexists(path), 'owned_path_collision')
+
+    def recheck_parent(self):
+        home, parents = candidate_parent()
+        require(home == self.home and parents == self.parents, 'candidate_parent_changed')
+
+    def create(self):
+        self.recheck_parent()
+        self.path.mkdir(mode=0o700)
+        # Capture immediately: failures after mkdir still enter caller cleanup.
+        self.created = candidate_directory(self.path, os.getuid(), scratch=True)
+        self.recheck_parent()
+
+    def remove(self):
+        self.recheck_parent()
+        require(self.created is not None and
+                candidate_directory(self.path, os.getuid(), scratch=True) == self.created,
+                'candidate_scratch_changed')
+        shutil.rmtree(self.path)
+
+
+def candidate_alias(root):
+    """Metadata only, once after initialization while the provider is alive."""
+    source, _ = resource()
+    native = source.parent.parent / 'bin/codex'
+    require(native.resolve(strict=True) == native and native.is_file() and os.access(native, os.X_OK),
+            'candidate_alias_unverified')
+    directory = root / 'codex-home/tmp/arg0'
+    require(directory.resolve(strict=True) == directory, 'candidate_alias_unverified')
+    # One live provider at a time. Bound enumeration; never scan inherited HOME.
+    with os.scandir(directory) as entries:
+        children = []
+        for entry in entries:
+            require(len(children) < 16, 'candidate_alias_unverified')
+            children.append(Path(entry.path))
+    aliases = []
+    for child in children:
+        if child.name.startswith('codex-arg0'):
+            candidate_directory(child, os.getuid(), scratch=True)
+            alias = child / 'codex-linux-sandbox'
+            require(alias.is_symlink() and alias.resolve(strict=True) == native,
+                    'candidate_alias_unverified')
+            aliases.append(alias)
+    require(len(aliases) == 1, 'candidate_alias_unverified')
+
+
 def fixtures(stage):
     target()
     source, _ = resource()
@@ -690,17 +810,26 @@ def fixtures(stage):
         chain(RUNTIME)
         identity(BWRAP, mode=0o755)
         require(digest(BWRAP.read_bytes()) == RESOURCE_HASH, 'candidate_hash_mismatch')
+    parent = candidate_parent()[0] if stage == 'candidate' else Path('/tmp')
+    launches = []
+    for name, provider in (('native', native[0]), ('npm', wrapper)):
+        nonce = uuid.uuid4().hex
+        scratch = parent / ('herdr-codex-' + nonce)
+        if stage == 'candidate':
+            CandidateScratch(scratch)
+        launches.append((name, provider, nonce, scratch))
     statuses = []
     reaped = [False, False]
     if stage == 'candidate':
         fixture_status_write(reaped, first=True)
-    for name, provider in (('native', native[0]), ('npm', wrapper)):
-        nonce = uuid.uuid4().hex
+    for name, provider, nonce, scratch in launches:
+        if stage == 'candidate':
+            CandidateScratch(scratch)
         env = os.environ.copy()
         if stage == 'candidate':
             env['PATH'] = str(RUNTIME) + os.pathsep + env['PATH']
         argv = [os.sys.executable, 'scripts/test_integrated_codex.py', '--provider-fixtures-only',
-                '--session', 'codex-proof-' + nonce, '--scratch', str(Path('/tmp') / ('herdr-codex-' + nonce)),
+                '--session', 'codex-proof-' + nonce, '--scratch', str(scratch),
                 '--provider-path', str(provider.resolve()), '--herdr-bin', str(Path('target/debug/herdr').resolve()),
                 '--diagnose-provider-runtime' if stage == 'baseline' else '--require-linux-enforcement']
         result = subprocess.run(argv, env=env, capture_output=True)
@@ -724,7 +853,7 @@ def fixtures(stage):
             'baseline_lsm_attribution': 'unknown'}
 
 
-FAILURE_CATEGORIES = frozenset(('attachment_inventory_invalid', 'policy_hash_disabled', 'policy_hash_invalid', 'policy_revision_unavailable', 'policy_revision_invalid', 'policy_revision_changed', 'owned_policy_hash_missing', 'cleanup_removal_uncertain', 'journal_write_uncertain')) | frozenset(('preflight_runtime_parent_chain', 'preflight_profile_parent_chain', 'preflight_state_parent_chain', 'preflight_provider_resource')) | frozenset(('fixture_status_parent_uncertain', 'fixture_status_owner')) | frozenset(('profile_parse_failed', 'profile_add_failed', 'profile_remove_failed', 'profile_download_failed', 'profile_extract_failed')) | frozenset(('attachment_collision', 'attachment_inventory_unavailable', 'attachment_inventory_uncertain', 'candidate_fixtures_failed', 'candidate_hash_mismatch', 'cleanup_archive_changed', 'cleanup_attachment_changed', 'cleanup_file_changed', 'cleanup_parent_changed', 'cleanup_paths_not_restored', 'cleanup_profile_changed', 'cleanup_profile_drift', 'cleanup_profiles_not_restored', 'cleanup_unknown_debris', 'cleanup_unowned_file', 'cleanup_unowned_profile', 'file_capability', 'fixture_cleanup_unverified', 'fixture_report_malformed', 'incompatible_restrictions', 'journal_identity_mismatch', 'journal_schema_mismatch', 'loaded_profile_drift', 'mandatory_restriction_missing', 'operation_failed', 'owned_attachment_changed', 'owned_binary_changed', 'owned_parent_changed', 'owned_path_collision', 'owned_profile_changed', 'parser_unavailable', 'preload_profile_drift', 'profile_archive_count', 'profile_collision', 'profile_customization_present', 'profile_include_unavailable', 'profile_inventory_uncertain', 'profile_member_mismatch', 'profile_package_mismatch', 'profile_source_mismatch', 'provider_identity_changed', 'provider_native_count', 'provider_package_mismatch', 'provider_path_uncertain', 'provider_resource_count', 'provider_resource_mismatch', 'restriction_drift', 'restrictions_disabled', 'setup_missing', 'unknown_restriction', 'unsafe_file_mode', 'unsafe_file_owner', 'unsafe_file_type', 'wrong_ci_target', 'wrong_fixture_user', 'wrong_target'))
+FAILURE_CATEGORIES = CANDIDATE_PATH_DIAGNOSTICS | frozenset(('attachment_inventory_invalid', 'policy_hash_disabled', 'policy_hash_invalid', 'policy_revision_unavailable', 'policy_revision_invalid', 'policy_revision_changed', 'owned_policy_hash_missing', 'cleanup_removal_uncertain', 'journal_write_uncertain')) | frozenset(('preflight_runtime_parent_chain', 'preflight_profile_parent_chain', 'preflight_state_parent_chain', 'preflight_provider_resource')) | frozenset(('fixture_status_parent_uncertain', 'fixture_status_owner')) | frozenset(('profile_parse_failed', 'profile_add_failed', 'profile_remove_failed', 'profile_download_failed', 'profile_extract_failed')) | frozenset(('attachment_collision', 'attachment_inventory_unavailable', 'attachment_inventory_uncertain', 'candidate_fixtures_failed', 'candidate_hash_mismatch', 'cleanup_archive_changed', 'cleanup_attachment_changed', 'cleanup_file_changed', 'cleanup_parent_changed', 'cleanup_paths_not_restored', 'cleanup_profile_changed', 'cleanup_profile_drift', 'cleanup_profiles_not_restored', 'cleanup_unknown_debris', 'cleanup_unowned_file', 'cleanup_unowned_profile', 'file_capability', 'fixture_cleanup_unverified', 'fixture_report_malformed', 'incompatible_restrictions', 'journal_identity_mismatch', 'journal_schema_mismatch', 'loaded_profile_drift', 'mandatory_restriction_missing', 'operation_failed', 'owned_attachment_changed', 'owned_binary_changed', 'owned_parent_changed', 'owned_path_collision', 'owned_profile_changed', 'parser_unavailable', 'preload_profile_drift', 'profile_archive_count', 'profile_collision', 'profile_customization_present', 'profile_include_unavailable', 'profile_inventory_uncertain', 'profile_member_mismatch', 'profile_package_mismatch', 'profile_source_mismatch', 'provider_identity_changed', 'provider_native_count', 'provider_package_mismatch', 'provider_path_uncertain', 'provider_resource_count', 'provider_resource_mismatch', 'restriction_drift', 'restrictions_disabled', 'setup_missing', 'unknown_restriction', 'unsafe_file_mode', 'unsafe_file_owner', 'unsafe_file_type', 'wrong_ci_target', 'wrong_fixture_user', 'wrong_target'))
 
 
 def failure_category(error):

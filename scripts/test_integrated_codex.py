@@ -688,6 +688,9 @@ def runtime_probe_observation(result=None, outcome='not_run'):
 # Public candidate evidence accepts these literal harness categories only. Live
 # model/consent/API failures are deliberately outside this fixture-only schema.
 FIXTURE_DIAGNOSTICS = frozenset({
+    'candidate_home_invalid', 'candidate_temp_invalid', 'candidate_home_unsafe',
+    'candidate_temp_overlap', 'candidate_project_marker', 'candidate_parent_changed',
+    'candidate_scratch_changed', 'candidate_alias_unverified', 'owned_path_collision',
     'fixture_initialize_version_mismatch', 'fixture_unexpected_authenticated_account',
     'fixture_provider_deadline', 'fixture_provider_exited', 'fixture_provider_request_error',
     'fixture_input_bound', 'fixture_output_bound', 'fixture_stderr_bound', 'fixture_pending_bound',
@@ -904,6 +907,31 @@ def enforcement_observation(result):
     return value
 
 
+def candidate_check(action, *args):
+    try:
+        from ci_codex_sandbox import Refused
+        import ci_codex_sandbox as sandbox
+    except ModuleNotFoundError:
+        from scripts.ci_codex_sandbox import Refused
+        from scripts import ci_codex_sandbox as sandbox
+    try:
+        return (getattr(sandbox, action) if isinstance(action, str) else action)(*args)
+    except Refused as error:
+        raise ProofFailure(str(error)) from None
+    except (OSError, RuntimeError):
+        raise ProofFailure('fixture_candidate_environment') from None
+
+
+def candidate_denial_target(root, canary):
+    home, _ = candidate_check('candidate_parent')
+    parent = canary.parent.resolve(strict=True)
+    roots = (*candidate_check('candidate_temp_roots'), root.resolve(strict=True),
+             (root / 'codex-home').resolve(), (root / 'sqlite').resolve())
+    if (parent != canary.parent or parent.parent != home or
+            not candidate_check('candidate_outside', canary.resolve(), roots)):
+        raise ProofFailure('fixture_denial_target_invalid')
+
+
 def linux_enforcement(client, root, python, evidence=None):
     # HOME is intentionally preserved by descriptor_environment. Use a NEW
     # private child of that directory, outside cwd and the /tmp writable roots.
@@ -922,10 +950,10 @@ def linux_enforcement(client, root, python, evidence=None):
     help_result = subprocess.run([str(BWRAP), '--help'], capture_output=True, timeout=10)
     if help_result.returncode or not all(flag in help_result.stdout for flag in (b'--as-pid-1', b'--perms', b'--argv0', b'--ro-bind-fd')):
         raise ProofFailure('fixture_candidate_ineligible')
-    with tempfile.TemporaryDirectory(prefix='herdr-codex-denial-', dir=Path.home()) as temporary, socket.socket() as listener:
+    home, _ = candidate_check('candidate_parent')
+    with tempfile.TemporaryDirectory(prefix='herdr-codex-denial-', dir=home) as temporary, socket.socket() as listener:
         canary = Path(temporary) / 'canary'
-        if root == canary.parent or root in canary.parents or Path('/tmp') in canary.parents:
-            raise ProofFailure('fixture_denial_target_invalid')
+        candidate_denial_target(root, canary)
         canary.write_bytes(b'parent-control')
         if canary.read_bytes() != b'parent-control':
             raise ProofFailure('fixture_parent_write_control')
@@ -967,12 +995,15 @@ def linux_enforcement(client, root, python, evidence=None):
 
 def provider_fixtures(args):
     validate_targets(args.session, args.scratch)
+    guard = candidate_check('CandidateScratch', args.scratch) if getattr(args, 'require_linux_enforcement', False) else None
     process_parents()
     provider = validate_provider(args.provider_path)
-    args.scratch.mkdir(mode=0o700)
+    if guard is None:
+        args.scratch.mkdir(mode=0o700)
     root = args.scratch
     script = root / 'descriptor_child.py'
-    script.write_text(DESCRIPTOR_CHILD)
+    if guard is None:
+        script.write_text(DESCRIPTOR_CHILD)
     python = str(Path(os.sys.executable).resolve())
     report = {'provider_version': '0.154.0', 'platform': os.uname().sysname,
               'qualification': 'UNVERIFIED', 'tool_fd_isolation': 'UNVERIFIED',
@@ -982,12 +1013,18 @@ def provider_fixtures(args):
     owned_children = set()
     evidence = CandidateFailureEvidence() if getattr(args, 'require_linux_enforcement', False) else None
     try:
+        if guard is not None:
+            candidate_check(guard.create)
+            report['candidate_paths'] = {'safe_parent': True, 'outside_temp': True, 'provider_alias': False}
+            script.write_text(DESCRIPTOR_CHILD)
         diagnose = getattr(args, 'diagnose_provider_runtime', False) and os.sys.platform == 'linux'
         if diagnose:
             report['runtime_environment'] = runtime_environment_metadata()
         client = DirectProvider(provider, root, owners=providers)
         if evidence is not None:
             client.candidate_evidence = evidence
+            candidate_check('candidate_alias', root)
+            report['candidate_paths']['provider_alias'] = True
         for mode in ('null', 'pipe', 'pty'):
             params = {'command': [python, str(script), mode, '-'], 'cwd': str(root), 'timeoutMs': 10000}
             process_id = 'owned-' + mode
@@ -1129,9 +1166,12 @@ def provider_fixtures(args):
             cleanup_step(errors, provider.close)
         cleanup_step(errors, lambda: eventually(lambda: not (owned_children & process_parents().keys()),
                                                'fixture_owned_child_cleanup', timeout=5))
+        if not errors and guard is not None:
+            cleanup_step(errors, lambda: candidate_check(guard.remove))
         if not errors:
             report['owned_cleanup'] = 'PASS'
-            shutil.rmtree(root)
+            if guard is None:
+                shutil.rmtree(root)
         else:
             report['owned_cleanup'] = 'UNVERIFIED'
             if evidence is not None:
@@ -1145,6 +1185,88 @@ def provider_fixtures(args):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_candidate_setup_and_cleanup_faults_keep_truthful_ownership(self):
+        from scripts.test_ci_codex_sandbox import SimulatedCandidateHome
+        from scripts import ci_codex_sandbox as sandbox
+        for fault in ('mkdir', 'setup', 'provider_start', 'reap', 'rmtree'):
+            with self.subTest(fault=fault), SimulatedCandidateHome() as host:
+                args = argparse.Namespace(session='codex-proof-' + 'a' * 32, scratch=host.scratch,
+                                          provider_path=Path('/unused'), require_linux_enforcement=True)
+                provider = mock.Mock()
+                provider.response.return_value = {'exitCode': 1, 'stdout': '', 'stderr': ''}
+                events = []
+                def close():
+                    events.append('close')
+                    if fault == 'reap':
+                        raise ProofFailure('fixture_owned_tree_cleanup')
+                provider.close.side_effect = close
+                def start(*values, **kwargs):
+                    if fault == 'provider_start':
+                        raise ProofFailure('fixture_provider_exited')
+                    kwargs['owners'].append(provider)
+                    return provider
+                write, mkdir, remove = Path.write_text, Path.mkdir, shutil.rmtree
+                def setup(path, *values, **kwargs):
+                    if fault == 'setup' and path.name == 'descriptor_child.py':
+                        raise OSError('synthetic setup failure')
+                    return write(path, *values, **kwargs)
+                def create(path, *values, **kwargs):
+                    if fault == 'mkdir' and path == host.scratch:
+                        raise OSError('synthetic creation failure')
+                    return mkdir(path, *values, **kwargs)
+                def delete(path, *values, **kwargs):
+                    events.append('remove')
+                    if fault == 'rmtree':
+                        raise OSError('synthetic removal failure')
+                    return remove(path, *values, **kwargs)
+                unrelated = host.home / 'unrelated'
+                unrelated.write_text('keep')
+                with mock.patch(__name__ + '.validate_provider', return_value='/unused'), mock.patch(
+                        __name__ + '.process_parents', return_value={}), mock.patch(
+                        __name__ + '.DirectProvider', side_effect=start), mock.patch.object(sandbox, 'candidate_alias'), mock.patch.object(
+                        Path, 'write_text', setup), mock.patch.object(Path, 'mkdir', create), mock.patch.object(
+                        shutil, 'rmtree', delete), redirect_stdout(io.StringIO()) as output:
+                    if fault == 'setup':
+                        with self.assertRaises(OSError):
+                            provider_fixtures(args)
+                    else:
+                        self.assertEqual(provider_fixtures(args), 1)
+                report = json.loads(output.getvalue())
+                self.assertEqual(report['owned_cleanup'], 'PASS' if fault in ('setup', 'provider_start') else 'UNVERIFIED')
+                self.assertEqual(host.scratch.exists(), fault in ('reap', 'rmtree'))
+                self.assertEqual(unrelated.read_text(), 'keep')
+                if fault == 'reap':
+                    self.assertNotIn('remove', events)
+                if fault == 'rmtree':
+                    self.assertLess(events.index('close'), events.index('remove'))
+                self.assertEqual(report['qualification'], 'UNVERIFIED')
+
+    def test_candidate_denial_target_excludes_all_resolved_writable_roots(self):
+        from scripts.test_ci_codex_sandbox import SimulatedCandidateHome
+        from scripts import ci_codex_sandbox as sandbox
+        with SimulatedCandidateHome() as host:
+            host.scratch.mkdir(mode=0o700)
+            sibling = host.home / 'herdr-codex-denial-owned'
+            sibling.mkdir(mode=0o700)
+            canary = sibling / 'canary'
+            candidate_denial_target(host.scratch, canary)
+            for parent in (host.scratch, host.temp):
+                with self.assertRaises(ProofFailure):
+                    candidate_denial_target(host.scratch, parent / 'canary')
+            for writable in ('codex-home', 'sqlite'):
+                alias = host.scratch / writable
+                alias.symlink_to(sibling, target_is_directory=True)
+                with self.assertRaisesRegex(ProofFailure, 'fixture_denial_target_invalid'):
+                    candidate_denial_target(host.scratch, canary)
+                alias.unlink()
+            with mock.patch.object(sandbox, 'candidate_temp_roots', return_value=(sibling, Path('/tmp'))):
+                with self.assertRaisesRegex(ProofFailure, 'fixture_denial_target_invalid'):
+                    candidate_denial_target(host.scratch, canary)
+            with mock.patch.dict(os.environ, {'TMPDIR': str(host.home)}):
+                with self.assertRaisesRegex(ProofFailure, 'candidate_temp_overlap'):
+                    candidate_denial_target(host.scratch, canary)
+            self.assertFalse(canary.exists())
+
     def test_candidate_cached_response_observation_is_correlated_and_has_no_io(self):
         observer = CandidateFailureEvidence()
         client = DirectProvider.__new__(DirectProvider)
@@ -1253,7 +1375,10 @@ class SafetyTests(unittest.TestCase):
                                       provider_path=Path('/unused'), require_linux_enforcement=enabled)
             with mock.patch(__name__ + '.validate_provider', return_value='/unused'), mock.patch(
                     __name__ + '.process_parents', return_value={}), mock.patch(
-                    __name__ + '.DirectProvider', ReceivedFramesProvider), redirect_stdout(io.StringIO()) as output:
+                    __name__ + '.DirectProvider', ReceivedFramesProvider), mock.patch(
+                    __name__ + '.candidate_check', side_effect=lambda action, *values: mock.Mock(
+                        create=lambda: root.mkdir(mode=0o700), remove=lambda: shutil.rmtree(root))
+                        if action == 'CandidateScratch' else action() if callable(action) else None), redirect_stdout(io.StringIO()) as output:
                 status = provider_fixtures(args)
             return status, json.loads(output.getvalue()), trace
 
@@ -1388,7 +1513,9 @@ class SafetyTests(unittest.TestCase):
                 subprocess, 'run', return_value=mock.Mock(returncode=0, stdout=b'--as-pid-1 --perms --argv0 --ro-bind-fd')), mock.patch.object(
                 Path, 'home', return_value=Path('/home/runner')), mock.patch.object(Path, 'read_bytes', read), mock.patch.object(
                 Path, 'write_bytes', write), mock.patch.object(tempfile, 'TemporaryDirectory') as temporary, mock.patch.object(
-                socket, 'socket') as socket_factory, mock.patch.object(socket, 'create_connection', return_value=connection):
+                socket, 'socket') as socket_factory, mock.patch.object(socket, 'create_connection', return_value=connection), mock.patch(
+                __name__ + '.candidate_check', return_value=(Path('/home/runner'), {})), mock.patch(
+                __name__ + '.candidate_denial_target'):
             temporary.return_value.__enter__.return_value = '/home/runner/herdr-codex-denial-owned'
             socket_factory.return_value.__enter__.return_value = listener
             observation = linux_enforcement(provider, Path('/tmp/owned'), '/pinned/python')

@@ -19,6 +19,287 @@ PROFILE_SOURCE = b"# This profile allows almost everything and only exists to al
 REAL_DOWNLOAD_PROFILE = sandbox.download_profile
 
 
+class SimulatedCandidateHome:
+    """Real owned files; only host ancestors, /tmp and Linux target are simulated."""
+    def __enter__(self):
+        self.stack = ExitStack()
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory())).resolve()
+        self.home = self.root / 'home'
+        self.home.mkdir(mode=0o700)
+        self.temp = self.root / 'rust-temp'
+        self.temp.mkdir(mode=0o700)
+        self.scratch = self.home / ('herdr-codex-' + 'a' * 32)
+        lstat, resolve = Path.lstat, Path.resolve
+        def metadata(path):
+            st = lstat(path)
+            if path in self.root.parents:
+                return SimpleNamespace(st_dev=st.st_dev, st_ino=st.st_ino, st_uid=0,
+                                       st_mode=stat.S_IFDIR | 0o755)
+            return st
+        def canonical(path, strict=False):
+            return Path('/simulated-system-tmp') if path == Path('/tmp') else resolve(path, strict=strict)
+        self.stack.enter_context(mock.patch.object(Path, 'lstat', metadata))
+        self.stack.enter_context(mock.patch.object(Path, 'resolve', canonical))
+        self.stack.enter_context(mock.patch.object(sandbox, 'target', return_value=os.getuid()))
+        self.stack.enter_context(mock.patch.dict(os.environ, {'HOME': str(self.home), 'TMPDIR': str(self.temp)}))
+        return self
+
+    def __exit__(self, *args):
+        self.stack.close()
+
+
+class CandidateHomeTests(unittest.TestCase):
+    def setUp(self):
+        patch = mock.patch.object(os, 'listxattr', return_value=[], create=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_exact_candidate_target_rejects_before_home_lookup_or_provider(self):
+        env = {'CI': 'true', 'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'bfirestone/herdr',
+               'GITHUB_REF': 'refs/heads/feat/desktop-exact-delivery'}
+        with mock.patch.object(sandbox.platform, 'system', return_value='Linux') as system, mock.patch.object(
+                sandbox.platform, 'machine', return_value='x86_64') as machine, mock.patch.object(
+                Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID=24.04\n') as release, mock.patch.dict(
+                os.environ, env, clear=True), mock.patch.object(os, 'getuid', return_value=1001) as uid, mock.patch.object(
+                os, 'geteuid', return_value=1001) as euid, mock.patch.object(Path, 'home') as home, mock.patch.object(subprocess, 'run') as launch:
+            self.assertEqual(sandbox.target(), 1001)
+            for boundary, invalid in ((system, 'Darwin'), (machine, 'aarch64'), (release, 'ID=debian\nVERSION_ID=24.04'),
+                                      (release, 'ID=ubuntu\nVERSION_ID=22.04'), (uid, 0), (euid, 0), (euid, 1002)):
+                original = boundary.return_value
+                boundary.return_value = invalid
+                with self.assertRaises(sandbox.Refused):
+                    sandbox.candidate_parent()
+                boundary.return_value = original
+            for key in env:
+                with mock.patch.dict(os.environ, {key: 'wrong'}), self.assertRaises(sandbox.Refused):
+                    sandbox.candidate_parent()
+            home.assert_not_called()
+            launch.assert_not_called()
+
+    def test_inherited_home_and_rust_temp_must_be_explicit_canonical_directories(self):
+        with SimulatedCandidateHome() as host:
+            link = host.root / 'link'
+            link.symlink_to(host.home, target_is_directory=True)
+            file = host.root / 'file'
+            file.write_text('unrelated')
+            for key in ('HOME', 'TMPDIR'):
+                for value in ('', 'relative', str(host.root / 'missing'), str(file), str(link),
+                              str(host.home / '..' / 'home')):
+                    with self.subTest(key=key, value=value), mock.patch.dict(os.environ, {key: value}), self.assertRaises(sandbox.Refused):
+                        sandbox.candidate_parent()
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(Path, 'home') as fallback:
+                with self.assertRaisesRegex(sandbox.Refused, 'candidate_home_invalid'):
+                    sandbox.candidate_parent()
+                fallback.assert_not_called()
+            with mock.patch.dict(os.environ, {'HOME': str(host.home)}, clear=True):
+                # Missing TMPDIR uses Rust's fixed /tmp, never Python TEMP/TMP.
+                with mock.patch.object(sandbox, 'candidate_canonical', wraps=sandbox.candidate_canonical) as canonical:
+                    with self.assertRaises(sandbox.Refused):
+                        sandbox.candidate_temp_roots()  # simulated /tmp spelling is noncanonical on this host
+                    canonical.assert_called_once_with('/tmp', 'candidate_temp_invalid')
+            with mock.patch.object(Path, 'home', return_value=host.root), self.assertRaises(sandbox.Refused):
+                sandbox.candidate_parent()
+            with mock.patch.dict(os.environ, {'HOME': '/'}), self.assertRaises(sandbox.Refused):
+                sandbox.candidate_parent()
+
+    def test_temp_containment_is_component_based_and_never_changes_environment(self):
+        with SimulatedCandidateHome() as host:
+            before = dict(os.environ)
+            home, _ = sandbox.candidate_parent()
+            self.assertEqual(home, host.home)
+            self.assertEqual(dict(os.environ), before)
+            for temporary in (host.home, host.root):
+                with mock.patch.dict(os.environ, {'TMPDIR': str(temporary)}), self.assertRaisesRegex(sandbox.Refused, 'candidate_temp_overlap'):
+                    sandbox.candidate_parent()
+            self.assertTrue(sandbox.candidate_outside(Path('/tmp-other/home'), (Path('/tmp'),)))
+            self.assertFalse(sandbox.candidate_outside(Path('/tmp'), (Path('/tmp'),)))
+            self.assertFalse(sandbox.candidate_outside(Path('/tmp/home'), (Path('/tmp'),)))
+
+    def test_parent_owner_modes_and_ancestor_git_markers_fail_closed(self):
+        with SimulatedCandidateHome() as host:
+            for directory in (host.home, host.root):
+                for mode in (0o777, 0o775, 0o2700, 0o4700):
+                    original = Path.lstat
+                    def unsafe_mode(path):
+                        st = original(path)
+                        return SimpleNamespace(st_dev=st.st_dev, st_ino=st.st_ino, st_uid=st.st_uid,
+                                               st_mode=stat.S_IFDIR | mode) if path == directory else st
+                    with mock.patch.object(Path, 'lstat', unsafe_mode), self.assertRaisesRegex(sandbox.Refused, 'candidate_home_unsafe'):
+                        sandbox.candidate_parent()
+                original = Path.lstat
+                def wrong_owner(path):
+                    st = original(path)
+                    return SimpleNamespace(st_dev=st.st_dev, st_ino=st.st_ino, st_mode=st.st_mode,
+                                           st_uid=os.getuid() + 123) if path == directory else st
+                with mock.patch.object(Path, 'lstat', wrong_owner), self.assertRaises(sandbox.Refused):
+                    sandbox.candidate_parent()
+                for kind in ('file', 'directory', 'symlink'):
+                    marker = directory / '.git'
+                    if kind == 'file':
+                        marker.write_text('must not read project configuration')
+                    elif kind == 'directory':
+                        marker.mkdir()
+                    else:
+                        marker.symlink_to(directory / 'missing')
+                    with self.assertRaisesRegex(sandbox.Refused, 'candidate_project_marker'):
+                        sandbox.candidate_parent()
+                    marker.rmdir() if kind == 'directory' else marker.unlink()
+                original = Path.lstat
+                def inaccessible_marker(path):
+                    if path == directory / '.git':
+                        raise PermissionError('metadata unavailable')
+                    return original(path)
+                with mock.patch.object(Path, 'lstat', inaccessible_marker), self.assertRaisesRegex(sandbox.Refused, 'candidate_project_marker'):
+                    sandbox.candidate_parent()
+
+    def test_scratch_collision_and_creation_recheck_do_not_remove_existing_paths(self):
+        with SimulatedCandidateHome() as host:
+            for kind in ('file', 'directory', 'symlink'):
+                if kind == 'file':
+                    host.scratch.write_text('keep')
+                elif kind == 'directory':
+                    host.scratch.mkdir()
+                else:
+                    host.scratch.symlink_to(host.home / 'missing')
+                with self.assertRaisesRegex(sandbox.Refused, 'owned_path_collision'):
+                    sandbox.CandidateScratch(host.scratch)
+                self.assertTrue(os.path.lexists(host.scratch))
+                host.scratch.rmdir() if kind == 'directory' else host.scratch.unlink()
+            guard = sandbox.CandidateScratch(host.scratch)
+            old = host.root / 'old-home'
+            host.home.rename(old)
+            host.home.mkdir(mode=0o700)
+            with self.assertRaisesRegex(sandbox.Refused, 'candidate_parent_changed'):
+                guard.create()
+            self.assertFalse(host.scratch.exists())
+
+    def test_scratch_cleanup_requires_original_parent_child_and_modes(self):
+        for drift in ('scratch_inode', 'scratch_symlink', 'scratch_mode', 'parent_inode', 'parent_mode'):
+            with self.subTest(drift=drift), SimulatedCandidateHome() as host:
+                guard = sandbox.CandidateScratch(host.scratch)
+                guard.create()
+                sentinel = host.scratch / 'keep'
+                sentinel.write_text('owned')
+                if drift.startswith('scratch_'):
+                    if drift == 'scratch_mode':
+                        host.scratch.chmod(0o750)
+                    else:
+                        host.scratch.rename(host.home / 'original')
+                        if drift == 'scratch_inode':
+                            host.scratch.mkdir(mode=0o700)
+                        else:
+                            host.scratch.symlink_to(host.home / 'original', target_is_directory=True)
+                elif drift == 'parent_inode':
+                    host.home.rename(host.root / 'original-home')
+                    host.home.mkdir(mode=0o700)
+                else:
+                    host.home.chmod(0o750)
+                with mock.patch.object(sandbox.shutil, 'rmtree') as remove, self.assertRaises(sandbox.Refused):
+                    guard.remove()
+                remove.assert_not_called()
+
+    def test_success_removes_entire_owned_child_only(self):
+        with SimulatedCandidateHome() as host:
+            guard = sandbox.CandidateScratch(host.scratch)
+            guard.create()
+            for relative in ('codex-home/tmp/arg0/provider', 'sqlite/state'):
+                path = host.scratch / relative
+                path.parent.mkdir(parents=True)
+                path.write_text('owned')
+            other = host.home / 'unrelated'
+            other.write_text('keep')
+            guard.remove()
+            self.assertFalse(host.scratch.exists())
+            self.assertEqual(other.read_text(), 'keep')
+
+    def test_provider_alias_is_observed_without_creating_or_reading_it(self):
+        with SimulatedCandidateHome() as host:
+            host.scratch.mkdir(mode=0o700)
+            source = host.root / 'provider/codex-resources/bwrap'
+            source.parent.mkdir(parents=True)
+            native = source.parent.parent / 'bin/codex'
+            native.parent.mkdir()
+            native.write_text('pinned executable')
+            native.chmod(0o755)
+            directory = host.scratch / 'codex-home/tmp/arg0/codex-arg0owned'
+            directory.mkdir(parents=True, mode=0o700)
+            alias = directory / 'codex-linux-sandbox'
+            with mock.patch.object(sandbox, 'resource', return_value=(source, b'')):
+                with self.assertRaises(sandbox.Refused):
+                    sandbox.candidate_alias(host.scratch)
+                alias.symlink_to(native)
+                with mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('alias content read')), mock.patch.object(
+                        subprocess, 'run', side_effect=AssertionError('provider invocation')):
+                    sandbox.candidate_alias(host.scratch)
+                alias.unlink()
+                alias.symlink_to(host.root / 'unrelated')
+                with self.assertRaises((sandbox.Refused, OSError)):
+                    sandbox.candidate_alias(host.scratch)
+
+    def test_wrapper_launches_distinct_nonce_children_and_preserves_inherited_environment(self):
+        for stage in ('baseline', 'candidate'):
+            with self.subTest(stage=stage), SimulatedLinux() as host, SimulatedCandidateHome() as home:
+                # Model the existing pinned package layout; subprocesses are not invoked.
+                source = host.root / 'prefix/codex-linux/vendor/x86_64-unknown-linux-musl/codex-resources/bwrap'
+                source.parent.mkdir(parents=True)
+                native = source.parent.parent / 'bin/codex'
+                native.parent.mkdir()
+                native.write_text('native')
+                reports = [subprocess.CompletedProcess([], 0, json.dumps({'owned_cleanup': 'PASS'})) for _ in range(2)]
+                sandbox.RUNTIME.mkdir(parents=True)
+                sandbox.BWRAP.write_bytes(b'pinned')
+                sandbox.BWRAP.chmod(0o755)
+                before = dict(os.environ)
+                with mock.patch.object(sandbox, 'resource', return_value=(source, b'')), mock.patch.object(
+                        sandbox, 'chain'), mock.patch.object(sandbox, 'digest', return_value=sandbox.RESOURCE_HASH), mock.patch.object(
+                        sandbox, 'fixture_status_write') as record, mock.patch.object(subprocess, 'run', side_effect=reports) as launch, redirect_stdout(io.StringIO()):
+                    sandbox.fixtures(stage)
+                self.assertEqual(dict(os.environ), before)
+                paths = []
+                for call in launch.call_args_list:
+                    argv, env = call.args[0], call.kwargs['env']
+                    scratch = Path(argv[argv.index('--scratch') + 1])
+                    session = argv[argv.index('--session') + 1]
+                    self.assertEqual(scratch.name, 'herdr-codex-' + session.removeprefix('codex-proof-'))
+                    self.assertEqual(scratch.parent, home.home if stage == 'candidate' else Path('/tmp'))
+                    self.assertEqual(env['HOME'], before['HOME'])
+                    self.assertEqual(env['TMPDIR'], before['TMPDIR'])
+                    expected = dict(before)
+                    if stage == 'candidate':
+                        expected['PATH'] = str(sandbox.RUNTIME) + os.pathsep + expected['PATH']
+                    self.assertEqual(env, expected)
+                    paths.append(scratch)
+                self.assertNotEqual(*paths)
+                self.assertEqual(record.call_count, 3 if stage == 'candidate' else 0)
+
+    def test_wrapper_parent_refusal_precedes_record_and_second_failure_retains_incomplete_record(self):
+        with SimulatedLinux() as host:
+            source = host.root / 'prefix/codex-linux/vendor/x86_64-unknown-linux-musl/codex-resources/bwrap'
+            native = source.parent.parent / 'bin/codex'
+            native.parent.mkdir(parents=True)
+            native.write_text('native')
+            sandbox.RUNTIME.mkdir(parents=True)
+            sandbox.BWRAP.write_bytes(b'pinned')
+            sandbox.BWRAP.chmod(0o755)
+            with mock.patch.object(sandbox, 'resource', return_value=(source, b'')), mock.patch.object(
+                    sandbox, 'chain'), mock.patch.object(sandbox, 'digest', return_value=sandbox.RESOURCE_HASH), mock.patch.object(
+                    sandbox, 'fixture_status_write') as record, mock.patch.object(subprocess, 'run') as launch:
+                with mock.patch.object(sandbox, 'candidate_parent', side_effect=sandbox.Refused('candidate_home_invalid')):
+                    with self.assertRaises(sandbox.Refused):
+                        sandbox.fixtures('candidate')
+                record.assert_not_called()
+                launch.assert_not_called()
+                with SimulatedCandidateHome():
+                    snapshots = []
+                    record.side_effect = lambda value, **kwargs: snapshots.append(list(value))
+                    launch.side_effect = [subprocess.CompletedProcess([], 0, '{"owned_cleanup":"PASS"}'),
+                                          subprocess.CompletedProcess([], 1, '{"owned_cleanup":"UNVERIFIED"}')]
+                    with self.assertRaisesRegex(sandbox.Refused, 'fixture_cleanup_unverified'), redirect_stdout(io.StringIO()):
+                        sandbox.fixtures('candidate')
+                    self.assertEqual(snapshots, [[False, False], [True, False]])
+
+
+
 class SimulatedLinux:
     """Real scratch files with mocked root identity and kernel/parser boundaries."""
     def __enter__(self):

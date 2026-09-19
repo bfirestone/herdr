@@ -309,7 +309,8 @@ Strict fixed booleans must prove Python startup, exact
 `bwrap//&unpriv_bwrap (enforce)` child label, nonroot execution, zero effective and
 permitted capabilities, no-new-privileges and seccomp filtering. PATH eligibility
 alone is insufficient. The same child must fail to overwrite one fresh owned
-canary outside cwd and `/tmp` writable roots and fail to connect to an owned
+canary outside all canonical cwd, CODEX_HOME, SQLite, `/tmp` and inherited
+TMPDIR writable roots and fail to connect to an owned
 parent loopback listener. Parent write/read and connection controls must succeed,
 the canary must remain unchanged, and the listener must receive no child
 connection. No user's existing file or external network endpoint is touched.
@@ -351,8 +352,46 @@ The public wrapper also retains the literal initialization, account, provider,
 bounds, input/isolation, enforcement, hook/MCP and cleanup failure categories;
 unknown strings and invalid fields receive fixed fallbacks. Normal fixture
 interaction and report behavior remains unchanged without the candidate flag.
-Actual failure phase and cause remain unknown until the new exact-commit run;
-these local observations do not identify an AppArmor or PTY defect.
+The source4 run `35424421272` at
+`758bb4b1d84b2c87ab238b1e0b6a2620df65be2c` passed native/npm null and pipe
+checks, then failed at PTY READY waiting with a matching cached, structurally
+valid RPC error. Its specific RPC code/message remains unknown. Owned provider
+reap and root restoration passed; enforcement, hook/MCP and no-drift remain
+unverified. The unchanged macOS job passed.
+
+Source5 relocates only the Linux candidate's whole scratch to a fresh immediate
+child of the explicitly inherited HOME, using the same per-launcher session
+nonce. Baseline remains under `/tmp`; default and macOS fixtures are unchanged.
+Pinned Codex source `6b9826e3aa83b1a5947db50f4332cb9c65f1b340` refuses release
+helper aliases beneath Rust's temporary root, while PTY launch uses the alias
+as its executable. This supports a placement repair hypothesis; it is not an
+observed ENOENT or proof of the earlier RPC error's cause.
+
+Before candidate provider invocation or scratch creation, metadata checks require
+the exact nonroot Ubuntu target, explicit absolute canonical HOME, runner
+ownership, and real root/runner-owned ancestors without group/other writes or
+set-id modes. Ancestor `.git` markers (including files and symlinks) are rejected
+without reading project or user configuration. Rust's temporary root is inherited
+TMPDIR when present, otherwise `/tmp`; invalid, missing-on-disk, empty, relative
+or symlink paths refuse instead of using Python's fallback rules. HOME and the
+whole scratch must be outside that root and canonical `/tmp`. Existing HOME,
+TMPDIR and parent permissions are never changed. The wrapper checks these
+boundaries before registering candidate launches.
+
+The harness rechecks retained parent identities at exclusive creation and after
+owned providers/children are reaped, then requires the original runner-owned
+0700 scratch identity before deletion. Replacement or metadata drift retains
+the path and reports cleanup unverified. Candidate setup failures also enter
+owned cleanup; candidate `owned_cleanup=PASS` is emitted only after deletion
+succeeds. Only the created child is removed, including provider arg0 and SQLite
+descendants. The separate denial canary remains a canonical HOME sibling outside
+all writable roots. A bounded metadata-only observation after existing provider
+initialization requires one provider-created `codex-linux-sandbox` symlink in
+owned CODEX_HOME to resolve to the pinned package's native executable. This
+creates no aliases and makes no extra RPC, read, wait or retry. Public
+`candidate_paths` contains only safe-parent, outside-temp and alias booleans.
+Actual Ubuntu parent metadata and successful native/npm aliases and PTY execution
+still require the next exact-commit CI run.
 
 The final workflow step always attempts exact owned rollback after an attempted
 apply. Before any candidate provider starts, a fresh fixed runner-owned status
