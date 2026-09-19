@@ -280,7 +280,9 @@ def attachment_may_match(attachment):
     if re.fullmatch(r'[a-zA-Z0-9_.:+ -]+', attachment):
         # apparmorfs returns the plain profile name when no xmatch is present.
         return False
-    if '@' in attachment or '\\' in attachment or any(ord(c) < 32 or ord(c) == 127 for c in attachment):
+    # Character classes are unsupported; reject even with a disjoint prefix.
+    # Balanced counts alone do not validate ordering or class contents.
+    if any(token in attachment for token in ('@', '\\', '[', ']')) or any(ord(c) < 32 or ord(c) == 127 for c in attachment):
         return True
     pending = [attachment]
     expanded = []
@@ -295,7 +297,7 @@ def attachment_may_match(attachment):
         else:
             expanded.append(value)
     for value in expanded:
-        if '{' in value or '}' in value or value.count('[') != value.count(']'):
+        if '{' in value or '}' in value:
             return True
         prefix = re.split(r'[*?\[{}\\@]', value, maxsplit=1)[0]
         if not prefix.startswith('/') or str(BWRAP).startswith(prefix):

@@ -121,6 +121,23 @@ class SandboxTests(unittest.TestCase):
         for pattern in (str(sandbox.BWRAP), '/var/**', '/{usr,var}/**', '/**', '<unknown>', '@{VAR}/bwrap', '', '/var/lib/herdr-*/**'):
             self.assertTrue(sandbox.attachment_may_match(pattern), pattern)
 
+    def test_unsupported_brackets_refuse_preflight_even_with_disjoint_prefix(self):
+        for pattern in ('/else/][', '/else/[]', '/else/[[]]', '/else/[ab]'):
+            with self.subTest(pattern=pattern), SimulatedLinux() as host:
+                observed = host.attachments()
+                observed['unrelated']['attach'] = pattern
+                with mock.patch.object(sandbox, 'attachments', return_value=observed), redirect_stdout(io.StringIO()) as output:
+                    with self.assertRaisesRegex(sandbox.Refused, '^attachment_collision$'):
+                        sandbox.preflight()
+                summary = json.loads(output.getvalue())['preflight_metadata']
+                self.assertEqual(summary['attachment_overlap'], 'known_or_possible')
+                self.assertNotIn(pattern, output.getvalue())
+                self.assertNotIn('unrelated', output.getvalue())
+                self.assertFalse(sandbox.STATE.exists())
+                self.assertFalse(sandbox.RUNTIME.exists())
+                self.assertFalse(sandbox.PROFILE.exists())
+                self.assertEqual(host.commands, [])
+
     def test_wrong_target_is_refused_before_any_mutation(self):
         with mock.patch.object(sandbox.platform, 'system', return_value='Darwin'), mock.patch.object(sandbox, 'run') as operation:
             with self.assertRaisesRegex(sandbox.Refused, 'wrong_target'):
