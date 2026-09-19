@@ -18,6 +18,7 @@ import fcntl
 import termios
 import struct
 import select
+import stat
 import subprocess
 import tempfile
 import time
@@ -645,6 +646,10 @@ RUNTIME_SIGNATURES = (
     ('exec_format', (('exec format error',),)),
     ('operation_not_permitted', (('operation not permitted',),)),
     ('invalid_argument', (('invalid argument',),)),
+    ('bwrap_capget_root', (('capget (for uid == 0) failed',),)),
+    ('bwrap_bind_dirfd_race', (('race condition binding dirfd',),)),
+    ('bwrap_rtm_newaddr', (('loopback: failed rtm_newaddr',),)),
+    ('bwrap_rtm_newlink', (('loopback: failed rtm_newlink',),)),
 )
 
 
@@ -729,6 +734,47 @@ def diagnose_provider_runtime(client, root, python, original):
     return detail
 
 
+def runtime_environment_metadata():
+    """Fixed read-only parent observations; these do not attest sandbox policy."""
+    system_executable = None
+    try:
+        system_executable = stat.S_ISREG(os.stat('/usr/bin/bwrap').st_mode) and os.access('/usr/bin/bwrap', os.X_OK)
+    except FileNotFoundError:
+        system_executable = False
+    except OSError:
+        pass
+    parent_is_system = None
+    try:
+        candidate = shutil.which('bwrap')
+        if candidate is not None:
+            parent_is_system = os.path.samefile(candidate, '/usr/bin/bwrap')
+    except (OSError, ValueError):
+        pass
+
+    def read_scalar(path, values):
+        try:
+            with open(path, 'rb') as source:
+                value = source.read(8)
+            # A full buffer may be an incomplete value. Never accept its prefix.
+            return values.get(value.strip()) if len(value) < 8 else None
+        except OSError:
+            return None
+
+    apparmor = read_scalar('/sys/module/apparmor/parameters/enabled', {b'Y': True, b'N': False})
+    restrict_userns = read_scalar('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', {b'0': 0, b'1': 1})
+    profile_present = None
+    try:
+        profile_present = stat.S_ISREG(os.stat('/etc/apparmor.d/bwrap').st_mode)
+    except FileNotFoundError:
+        profile_present = False
+    except OSError:
+        pass
+    return {'system_bwrap_executable': system_executable,
+            'parent_path_bwrap_is_system': parent_is_system,
+            'apparmor_enabled': apparmor, 'restrict_unprivileged_userns': restrict_userns,
+            'bwrap_profile_file_present': profile_present}
+
+
 def provider_fixtures(args):
     validate_targets(args.session, args.scratch)
     process_parents()
@@ -745,6 +791,9 @@ def provider_fixtures(args):
     providers = []
     owned_children = set()
     try:
+        diagnose = getattr(args, 'diagnose_provider_runtime', False) and os.sys.platform == 'linux'
+        if diagnose:
+            report['runtime_environment'] = runtime_environment_metadata()
         client = DirectProvider(provider, root, owners=providers)
         for mode in ('null', 'pipe', 'pty'):
             params = {'command': [python, str(script), mode, '-'], 'cwd': str(root), 'timeoutMs': 10000}
@@ -761,7 +810,6 @@ def provider_fixtures(args):
                 client.call('command/exec/write', {'processId': process_id,
                             'deltaBase64': base64.b64encode(b'pty-ok' if mode == 'pty' else b'child-only').decode(), 'closeStdin': mode == 'pipe'})
             result = client.response(request_id)
-            diagnose = getattr(args, 'diagnose_provider_runtime', False) and os.sys.platform == 'linux'
             if diagnose and runtime_exit_code(result) is None:
                 raise ProofFailure('fixture_malformed_result')
             if result['exitCode'] != 0:
@@ -973,7 +1021,9 @@ class SafetyTests(unittest.TestCase):
                 'failed to verify linux sandbox capabilities: error applying linux sandbox restrictions: '
                 'failed to execvp sandbox blocked creation of protected workspace metadata path '
                 'error while loading shared libraries: libpython traceback (most recent call last): '
-                'permission denied no such file or directory exec format error operation not permitted invalid argument')
+                'permission denied no such file or directory exec format error operation not permitted invalid argument '
+                'capget (for uid == 0) failed Race condition binding dirfd '
+                'loopback: Failed RTM_NEWADDR loopback: Failed RTM_NEWLINK')
         result = {'exitCode': -(2 ** 31), 'stdout': text, 'stderr': text}
         provider = mock.Mock()
         provider.child.poll.return_value = None
@@ -984,12 +1034,110 @@ class SafetyTests(unittest.TestCase):
                     'unreadable_glob', 'bwrap_unavailable', 'bwrap_message', 'namespace_message',
                     'proc_mount', 'inner_mount_verify', 'inner_capabilities', 'sandbox_restrictions',
                     'child_exec', 'protected_metadata', 'python_loader', 'python_traceback',
-                    'permission', 'missing', 'exec_format', 'operation_not_permitted', 'invalid_argument']
+                    'permission', 'missing', 'exec_format', 'operation_not_permitted', 'invalid_argument',
+                    'bwrap_capget_root', 'bwrap_bind_dirfd_race', 'bwrap_rtm_newaddr', 'bwrap_rtm_newlink']
         for name in ('original_control', 'true', 'python_startup'):
             for stream in ('stdout', 'stderr'):
                 self.assertEqual(detail[name][stream]['signatures'], expected)
         self.assertLessEqual(len(json.dumps(detail).encode()), 8192)
         self.assertFalse(detail['python_started'])
+
+    def test_runtime_diagnostics_specific_bwrap_literals_redact_suffixes(self):
+        cases = [('capget (for uid == 0) failed', 'bwrap_capget_root'),
+                 ('Race condition binding dirfd', 'bwrap_bind_dirfd_race'),
+                 ('loopback: Failed RTM_NEWADDR', 'bwrap_rtm_newaddr'),
+                 ('loopback: Failed RTM_NEWLINK', 'bwrap_rtm_newlink')]
+        for literal, label in cases:
+            for stream in ('stdout', 'stderr'):
+                with self.subTest(label=label, stream=stream):
+                    result = {stream: 'bwrap: ' + literal.upper() +
+                              ': Operation not permitted /private/secret-suffix'}
+                    item = runtime_output_metadata(result, stream)
+                    self.assertEqual(item['signatures'], ['bwrap_message', 'operation_not_permitted', label])
+                    self.assertFalse(item['unmatched_nonempty'])
+                    self.assertNotIn('secret-suffix', json.dumps(item))
+                    other = 'stderr' if stream == 'stdout' else 'stdout'
+                    self.assertEqual(runtime_output_metadata(result, other)['signatures'], [])
+                    self.assertNotIn(label, runtime_output_metadata({stream: literal[:-1]}, stream)['signatures'])
+
+    def environment_metadata(self, apparmor=b'Y\n', restrict=b'1\n', stat_error=None,
+                             access=True, which='/usr/bin/bwrap', samefile=True):
+        streams = [io.BytesIO(apparmor), io.BytesIO(restrict)]
+        reads = [mock.Mock(wraps=stream.read) for stream in streams]
+        handles = [mock.MagicMock() for _ in streams]
+        for handle, read in zip(handles, reads):
+            handle.__enter__.return_value.read = read
+        with mock.patch('os.stat', side_effect=stat_error, return_value=mock.Mock(st_mode=0o100755)) as status, mock.patch(
+                'os.access', return_value=access) as executable, mock.patch(
+                'shutil.which', return_value=which) as lookup, mock.patch(
+                'os.path.samefile', side_effect=samefile if isinstance(samefile, Exception) else None,
+                return_value=samefile) as same, mock.patch('builtins.open', side_effect=handles) as opened, mock.patch(
+                'subprocess.run') as process:
+            detail = runtime_environment_metadata()
+        process.assert_not_called()
+        self.assertEqual(status.call_args_list, [mock.call('/usr/bin/bwrap'), mock.call('/etc/apparmor.d/bwrap')])
+        self.assertEqual(opened.call_args_list, [mock.call('/sys/module/apparmor/parameters/enabled', 'rb'),
+                                               mock.call('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', 'rb')])
+        for read in reads:
+            read.assert_called_once_with(8)
+        self.assertLess(len(json.dumps(detail).encode()), 512)
+        return detail, executable, lookup, same
+
+    def test_runtime_environment_valid_fixed_scalars_and_parent_lookup(self):
+        detail, executable, lookup, same = self.environment_metadata()
+        self.assertEqual(detail, {'system_bwrap_executable': True, 'parent_path_bwrap_is_system': True,
+                                 'apparmor_enabled': True, 'restrict_unprivileged_userns': 1,
+                                 'bwrap_profile_file_present': True})
+        executable.assert_called_once_with('/usr/bin/bwrap', os.X_OK)
+        lookup.assert_called_once_with('bwrap')
+        same.assert_called_once_with('/usr/bin/bwrap', '/usr/bin/bwrap')
+        detail, _, _, _ = self.environment_metadata(apparmor=b'N\n', restrict=b'0\n', access=False,
+                                                   which='/private/secret-bwrap', samefile=False)
+        self.assertFalse(detail['system_bwrap_executable'])
+        self.assertFalse(detail['parent_path_bwrap_is_system'])
+        self.assertFalse(detail['apparmor_enabled'])
+        self.assertEqual(detail['restrict_unprivileged_userns'], 0)
+        self.assertNotIn('secret-bwrap', json.dumps(detail))
+        detail, _, _, same = self.environment_metadata(which=None)
+        self.assertIsNone(detail['parent_path_bwrap_is_system'])
+        same.assert_not_called()
+
+    def test_runtime_environment_missing_denied_malformed_and_bounded_reads(self):
+        for error, expected in [(FileNotFoundError('private'), False), (PermissionError('private'), None)]:
+            with self.subTest(error=type(error).__name__):
+                detail, executable, _, _ = self.environment_metadata(stat_error=error, samefile=error)
+                self.assertIs(detail['system_bwrap_executable'], expected)
+                self.assertIs(detail['bwrap_profile_file_present'], expected)
+                self.assertIsNone(detail['parent_path_bwrap_is_system'])
+                executable.assert_not_called()
+        for apparmor, restrict in [(b'', b''), (b'yes', b'2'), (b'y', b'-1'), (b'\xff', b'\xff'),
+                                  (b'Y       secret', b'1       secret')]:
+            with self.subTest(apparmor=apparmor, restrict=restrict):
+                detail, _, _, _ = self.environment_metadata(apparmor=apparmor, restrict=restrict)
+                self.assertIsNone(detail['apparmor_enabled'])
+                self.assertIsNone(detail['restrict_unprivileged_userns'])
+                self.assertNotIn('secret', json.dumps(detail))
+        for error in (FileNotFoundError('private'), PermissionError('private'), OSError('private')):
+            with mock.patch('builtins.open', side_effect=error):
+                detail = runtime_environment_metadata()
+            self.assertIsNone(detail['apparmor_enabled'])
+            self.assertIsNone(detail['restrict_unprivileged_userns'])
+            self.assertNotIn('private', json.dumps(detail))
+
+    def test_runtime_environment_collected_once_only_for_opted_in_linux_fixture(self):
+        for enabled, platform in [(False, 'linux'), (False, 'darwin'), (True, 'darwin'), (True, 'linux')]:
+            with self.subTest(enabled=enabled, platform=platform), mock.patch(
+                    __name__ + '.runtime_environment_metadata', return_value={'apparmor_enabled': None}) as metadata:
+                status, report, provider, _ = self.diagnostic_fixture(
+                    [{'exitCode': 1}, {'exitCode': 0}, {'exitCode': 0}], enabled=enabled, platform=platform)
+            self.assertEqual(status, 1)
+            if enabled and platform == 'linux':
+                metadata.assert_called_once_with()
+                self.assertEqual(report['runtime_environment'], {'apparmor_enabled': None})
+            else:
+                metadata.assert_not_called()
+                self.assertNotIn('runtime_environment', report)
+            provider.close.assert_called_once()
 
     def test_runtime_diagnostics_malformed_responses_and_errors_stop_probes(self):
         cases = [(None, 'malformed_result'), ([], 'malformed_result'),
