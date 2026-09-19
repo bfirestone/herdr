@@ -604,15 +604,22 @@ impl LinuxExecutableObservation<'_> {
                 failure.as_ref().map(ToString::to_string).unwrap_or_default(),
             ))
         };
-        for attempt in 0..=4 {
-            if now() >= self.deadline || (attempt > 0 && now() > end) {
-                return Err(diagnostic(
+        // Synchronous kernel reads cannot be preempted. A late return is still
+        // unresolved: do not accept its metadata/absence or start another read.
+        let check_deadline = |latest, failure: &Option<std::io::Error>, time| {
+            if time >= end {
+                Err(diagnostic(
                     "observation/caller deadline exhausted",
                     latest,
-                    &failure,
-                    now(),
-                ));
+                    failure,
+                    time,
+                ))
+            } else {
+                Ok(())
             }
+        };
+        for attempt in 0..=4 {
+            check_deadline(latest, &failure, now())?;
             latest = read_birth(self.pid).map_err(|error| {
                 diagnostic(
                     &format!("birth read failed: {error}"),
@@ -621,6 +628,7 @@ impl LinuxExecutableObservation<'_> {
                     now(),
                 )
             })?;
+            check_deadline(latest, &failure, now())?;
             if latest != Some(self.birth) {
                 return Ok(None);
             }
@@ -634,6 +642,7 @@ impl LinuxExecutableObservation<'_> {
                     None
                 }
             };
+            check_deadline(latest, &failure, now())?;
             latest = read_birth(self.pid).map_err(|error| {
                 diagnostic(
                     &format!("birth recheck failed: {error}"),
@@ -642,6 +651,7 @@ impl LinuxExecutableObservation<'_> {
                     now(),
                 )
             })?;
+            check_deadline(latest, &failure, now())?;
             if latest != Some(self.birth) {
                 return Ok(None);
             }
@@ -2315,6 +2325,67 @@ mod tests {
                     waits,
                     "expired caller deadline must not reset per process"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn linux_pending_executable_rejects_callbacks_returning_after_deadline() {
+        for cap in [15, 40] {
+            for delayed in ["initial birth", "executable", "final birth"] {
+                for birth in [Some((123, 4)), None, Some((124, 4))] {
+                    let start = Instant::now();
+                    let clock = std::cell::Cell::new(start);
+                    let births = std::cell::Cell::new(0);
+                    let executables = std::cell::Cell::new(0);
+                    let result = LinuxExecutableObservation {
+                        pid: 42,
+                        birth: (123, 4),
+                        operation: "test delayed callback",
+                        deadline: start + Duration::from_millis(if cap == 40 { 100 } else { cap }),
+                    }
+                    .observe(
+                        |_| {
+                            births.set(births.get() + 1);
+                            if delayed
+                                == if births.get() == 1 {
+                                    "initial birth"
+                                } else {
+                                    "final birth"
+                                }
+                            {
+                                clock.set(start + Duration::from_millis(cap + 1));
+                                Ok(birth)
+                            } else {
+                                Ok(Some((123, 4)))
+                            }
+                        },
+                        |_| {
+                            executables.set(executables.get() + 1);
+                            if delayed == "executable" {
+                                clock.set(start + Duration::from_millis(cap + 1));
+                            }
+                            Ok(PathBuf::from("/cargo/herdr"))
+                        },
+                        || clock.get(),
+                        |_| panic!("successful callbacks must not enter Pending waits"),
+                    );
+                    let context = format!("cap={cap} delayed={delayed} birth={birth:?}");
+                    assert!(
+                        result.is_err(),
+                        "late Metadata/Gone must remain unresolved: {context}"
+                    );
+                    assert_eq!(
+                        births.get(),
+                        if delayed == "final birth" { 2 } else { 1 },
+                        "no birth read after expiry: {context}"
+                    );
+                    assert_eq!(
+                        executables.get(),
+                        u32::from(delayed != "initial birth"),
+                        "no executable read after expiry: {context}"
+                    );
+                }
             }
         }
     }
