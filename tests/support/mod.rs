@@ -1185,10 +1185,51 @@ fn identity_still_owned_from(
     }
 }
 
+fn wait_for_test_process_exit_from(
+    identity: &TestProcessIdentity,
+    deadline: Instant,
+    mut poll_wait: impl FnMut() -> std::io::Result<bool>,
+    mut still_owned: impl FnMut() -> std::io::Result<bool>,
+    mut now: impl FnMut() -> Instant,
+    mut wait: impl FnMut(Duration),
+) -> std::io::Result<bool> {
+    while now() < deadline {
+        // ECHILD is expected for detached imports (or a child already reaped
+        // elsewhere). It never establishes disappearance by itself. Zero and
+        // EINTR confirm neither reap nor absence, so keep the bounded poll armed.
+        let reaped_or_nonchild = match poll_wait() {
+            Ok(reaped) => reaped,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => true,
+            Err(error) if error.raw_os_error() == Some(libc::EINTR) => false,
+            Err(error) => {
+                return Err(bad_inspection(&format!(
+                    "waitpid PID {} birth {:?}: {error}",
+                    identity.pid, identity.birth,
+                )))
+            }
+        };
+        if now() >= deadline {
+            break;
+        }
+        let owned = still_owned()?;
+        if now() >= deadline {
+            break;
+        }
+        if reaped_or_nonchild && !owned {
+            return Ok(true);
+        }
+        wait(Duration::from_millis(20).min(deadline.saturating_duration_since(now())));
+    }
+    Ok(false)
+}
+
 pub fn terminate_test_process(
     identity: &TestProcessIdentity,
     deadline: Instant,
 ) -> std::io::Result<()> {
+    if identity.pid == 0 || identity.pid > i32::MAX as u32 {
+        return Err(bad_inspection("invalid cleanup PID"));
+    }
     for (signal, grace) in [
         (libc::SIGTERM, Duration::from_millis(400)),
         (libc::SIGKILL, Duration::from_secs(2)),
@@ -1210,27 +1251,31 @@ pub fn terminate_test_process(
                 )));
             }
         }
-        loop {
-            let mut status = 0;
-            unsafe {
-                libc::waitpid(identity.pid as i32, &mut status, libc::WNOHANG);
-            }
-            if Instant::now() >= end {
-                break;
-            }
-            if !identity_still_owned_before(identity, end)? {
-                return Ok(());
-            }
-            if Instant::now() >= end {
-                break;
-            }
-            thread::sleep(
-                Duration::from_millis(20).min(end.saturating_duration_since(Instant::now())),
-            );
+        if wait_for_test_process_exit_from(
+            identity,
+            end,
+            || {
+                let mut status = 0;
+                let waited =
+                    unsafe { libc::waitpid(identity.pid as i32, &mut status, libc::WNOHANG) };
+                match waited {
+                    0 => Ok(false),
+                    -1 => Err(std::io::Error::last_os_error()),
+                    pid if pid == identity.pid as i32 => {
+                        Ok(libc::WIFEXITED(status) || libc::WIFSIGNALED(status))
+                    }
+                    _ => Err(bad_inspection("waitpid returned unexpected PID")),
+                }
+            },
+            || identity_still_owned_before(identity, end),
+            Instant::now,
+            thread::sleep,
+        )? {
+            return Ok(());
         }
     }
     Err(bad_inspection(&format!(
-        "owned PID {} birth {:?} survived bounded cleanup",
+        "owned PID {} birth {:?} disappearance/reaping unresolved after bounded cleanup",
         identity.pid, identity.birth
     )))
 }
@@ -2326,6 +2371,135 @@ mod tests {
                     "expired caller deadline must not reset per process"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cleanup_wait_requires_reap_after_identity_disappears() {
+        for first in [0, libc::EINTR] {
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let polls = std::cell::Cell::new(0);
+            let identity = inspection_identity();
+            assert!(wait_for_test_process_exit_from(
+                &identity,
+                start + Duration::from_millis(400),
+                || {
+                    polls.set(polls.get() + 1);
+                    if polls.get() == 1 {
+                        if first == 0 {
+                            Ok(false)
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(first))
+                        }
+                    } else {
+                        Ok(true)
+                    }
+                },
+                || Ok(false),
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            )
+            .unwrap());
+            assert_eq!(
+                polls.get(),
+                2,
+                "absence alone must not discard a pending/interrupted child wait"
+            );
+            assert_eq!(clock.get() - start, Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn cleanup_wait_nonchild_errors_and_expiry_preserve_postconditions() {
+        let identity = inspection_identity();
+        for errno in [libc::ECHILD, libc::EPERM, libc::EINVAL] {
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let polls = std::cell::Cell::new(0);
+            let inspections = std::cell::Cell::new(0);
+            let result = wait_for_test_process_exit_from(
+                &identity,
+                start + Duration::from_millis(400),
+                || {
+                    polls.set(polls.get() + 1);
+                    Err(std::io::Error::from_raw_os_error(errno))
+                },
+                || {
+                    inspections.set(inspections.get() + 1);
+                    Ok(inspections.get() == 1)
+                },
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            );
+            if errno == libc::ECHILD {
+                assert!(
+                    result.unwrap(),
+                    "nonchild requires both ECHILD and disappearance"
+                );
+                assert_eq!(polls.get(), 2);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("waitpid PID 42 birth (123, 4)"), "{error}");
+                assert_eq!(
+                    inspections.get(),
+                    0,
+                    "unexpected wait errors must not accept absence"
+                );
+            }
+        }
+        for errno in [0, libc::EINTR] {
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let polls = std::cell::Cell::new(0);
+            assert!(
+                !wait_for_test_process_exit_from(
+                    &identity,
+                    start + Duration::from_millis(25),
+                    || {
+                        polls.set(polls.get() + 1);
+                        if errno == 0 {
+                            Ok(false)
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(errno))
+                        }
+                    },
+                    || Ok(false),
+                    || clock.get(),
+                    |delay| clock.set(clock.get() + delay),
+                )
+                .unwrap(),
+                "unconfirmed reap must exhaust the unchanged phase deadline"
+            );
+            assert_eq!(polls.get(), 2);
+            assert_eq!(clock.get() - start, Duration::from_millis(25));
+        }
+        for late_wait in [true, false] {
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(25);
+            let clock = std::cell::Cell::new(start);
+            let result = wait_for_test_process_exit_from(
+                &identity,
+                deadline,
+                || {
+                    if late_wait {
+                        clock.set(deadline);
+                    }
+                    Ok(true)
+                },
+                || {
+                    assert!(!late_wait, "expired wait must not start another inspection");
+                    clock.set(deadline);
+                    Ok(false)
+                },
+                || clock.get(),
+                |_| panic!("expired callbacks must not start another wait"),
+            )
+            .unwrap();
+            assert!(
+                !result,
+                "late reap/absence must not extend the caller's deadline"
+            );
         }
     }
 
