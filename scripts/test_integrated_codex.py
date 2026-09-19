@@ -1259,7 +1259,7 @@ class SafetyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProofFailure, 'fixture_denial_target_invalid'):
                     candidate_denial_target(host.scratch, canary)
                 alias.unlink()
-            with mock.patch.object(sandbox, 'candidate_temp_roots', return_value=(sibling, Path('/tmp'))):
+            with mock.patch.object(sandbox, 'candidate_temp_roots', return_value=(sibling, Path('/tmp').resolve())):
                 with self.assertRaisesRegex(ProofFailure, 'fixture_denial_target_invalid'):
                     candidate_denial_target(host.scratch, canary)
             with mock.patch.dict(os.environ, {'TMPDIR': str(host.home)}):
