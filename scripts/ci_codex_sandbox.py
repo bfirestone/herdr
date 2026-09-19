@@ -264,7 +264,8 @@ def preflight():
     source, data = resource()
     return {'schema': 1, 'uid': uid, 'restrictions': restrictions(), 'profiles': original,
             'source_identity': identity(source, root=False), 'source_hash': digest(data),
-            'parents': {}, 'files': {}, 'load_attempted': False, 'loaded': [], 'phase': 'registered'}
+            'parents': {}, 'files': {}, 'load_attempted': False, 'load_observed': False,
+            'loaded': [], 'phase': 'registered'}
 
 
 def write_journal(record):
@@ -298,8 +299,18 @@ def verify_source(record):
     no_customization()
 
 
+def verify_added_attachments(added, category):
+    expected = {'bwrap': str(BWRAP), 'unpriv_bwrap': 'unpriv_bwrap'}
+    expected = {name: attach for name, attach in expected.items() if name + ' (enforce)' in added}
+    observed = [(name, attach) for name, attach in attachments() if name in ('bwrap', 'unpriv_bwrap')]
+    # Check count as well as contents so duplicate names cannot hide uncertainty.
+    require(len(observed) == len(expected) and dict(observed) == expected, category)
+
+
 def verify_owned(record):
     verify_source(record)
+    require(record.get('load_observed') is True and set(record['loaded']) == OWNED_PROFILES,
+            'loaded_profile_drift')
     for key, path in (('parent', RUNTIME_PARENT), ('runtime', RUNTIME)):
         if key in record['parents']:
             require(identity(path, directory=True, mode=0o755) == record['parents'][key], 'owned_parent_changed')
@@ -309,8 +320,7 @@ def verify_owned(record):
     require(identity(PROFILE, mode=0o644) == record['files']['profile']['identity'] and
             digest(PROFILE.read_bytes()) == record['files']['profile']['hash'], 'owned_profile_changed')
     require(profiles() == sorted(record['profiles'] + list(OWNED_PROFILES)), 'loaded_profile_drift')
-    attached = dict(attachments())
-    require(attached.get('bwrap') == str(BWRAP) and attached.get('unpriv_bwrap') == 'unpriv_bwrap', 'owned_attachment_changed')
+    verify_added_attachments(OWNED_PROFILES, 'owned_attachment_changed')
 
 
 def apply():
@@ -344,7 +354,12 @@ def apply():
         try:
             run([PARSER, '-a', '-T', '-K', str(PROFILE)])
         finally:
-            record['loaded'] = sorted(set(profiles()) & OWNED_PROFILES)
+            current = set(profiles())
+            added = current & OWNED_PROFILES
+            require(current - added == set(record['profiles']), 'loaded_profile_drift')
+            verify_added_attachments(added, 'owned_attachment_changed')
+            record['loaded'] = sorted(added)
+            record['load_observed'] = True
             write_journal(record)
         verify_owned(record)
         record['phase'] = 'applied'
@@ -368,14 +383,18 @@ def cleanup():
     verify_source(record)
     current = set(profiles())
     require(current - OWNED_PROFILES == set(record['profiles']), 'cleanup_profile_drift')
-    added = current & OWNED_PROFILES
+    # An interrupted parser/observation/journal write leaves ownership unknown,
+    # even if a later inventory is empty. Preserve recovery evidence in that case.
+    require(not record['load_attempted'] or record.get('load_observed') is True, 'cleanup_unowned_profile')
+    recorded = set(record['loaded'])
+    require(current & OWNED_PROFILES <= recorded, 'cleanup_unowned_profile')
+    added = current & recorded
     require(not added or record['load_attempted'], 'cleanup_unowned_profile')
+    verify_added_attachments(added, 'cleanup_attachment_changed')
     if added:
         item = record['files'].get('profile')
         require(item and identity(PROFILE, mode=0o644) == item['identity'] and
                 digest(PROFILE.read_bytes()) == item['hash'], 'cleanup_profile_changed')
-        attached = dict(attachments())
-        require('bwrap (enforce)' not in added or attached.get('bwrap') == str(BWRAP), 'cleanup_attachment_changed')
         # On partial parser success remove only the exact profiles observed added.
         content = PROFILE.read_bytes()
         split = content.index(b'profile unpriv_bwrap ')

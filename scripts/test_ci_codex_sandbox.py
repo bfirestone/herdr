@@ -193,6 +193,85 @@ class SandboxTests(unittest.TestCase):
                 if removed:
                     self.assertNotIn(b'profile unpriv_bwrap ', removed[0])
 
+    def test_partial_add_recovery_refuses_later_unrecorded_profile_before_any_removal(self):
+        with SimulatedLinux() as host:
+            host.fail = 'partial_add'
+            with mock.patch.object(sandbox, 'cleanup', side_effect=sandbox.Refused('interrupted_rollback')):
+                with self.assertRaises(sandbox.Refused):
+                    sandbox.apply()
+            record = sandbox.read_journal()
+            self.assertEqual(record['loaded'], ['bwrap (enforce)'])
+            self.assertIs(record['load_observed'], True)
+            host.loaded.append('unpriv_bwrap (enforce)')
+            with self.assertRaisesRegex(sandbox.Refused, 'cleanup_unowned_profile'):
+                sandbox.cleanup()
+            self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+            self.assertEqual(sandbox.read_journal(), record)
+            self.assertTrue(sandbox.BWRAP.exists())
+            self.assertTrue(sandbox.PROFILE.exists())
+            # Once the independently added profile is gone, recorded ownership
+            # still permits recovery of this invocation's partial addition.
+            host.loaded.remove('unpriv_bwrap (enforce)')
+            self.assertEqual(sandbox.cleanup()['cleanup'], 'PASS')
+            removed = [kwargs['data'] for argv, kwargs in host.commands if '-R' in argv]
+            self.assertEqual(len(removed), 1)
+            self.assertNotIn(b'profile unpriv_bwrap ', removed[0])
+
+    def test_uncertain_load_observation_or_journal_write_retains_recovery_state(self):
+        for failure in ('inventory', 'attachments', 'journal'):
+            with self.subTest(failure=failure), SimulatedLinux() as host:
+                read_profiles = sandbox.profiles
+                read_attachments = sandbox.attachments
+                write_journal = sandbox.write_journal
+                def inventory():
+                    if failure == 'inventory' and any('-a' in argv for argv, _ in host.commands):
+                        raise OSError('simulated observation failure')
+                    return read_profiles()
+                def attached():
+                    if failure == 'attachments' and any('-a' in argv for argv, _ in host.commands):
+                        raise OSError('simulated observation failure')
+                    return read_attachments()
+                def journal(record):
+                    if failure == 'journal' and record['load_observed']:
+                        raise OSError('simulated journal failure')
+                    write_journal(record)
+                with mock.patch.object(sandbox, 'profiles', side_effect=inventory), mock.patch.object(
+                        sandbox, 'attachments', side_effect=attached), mock.patch.object(
+                        sandbox, 'write_journal', side_effect=journal):
+                    with self.assertRaises((OSError, sandbox.Refused)):
+                        sandbox.apply()
+                record = sandbox.read_journal()
+                self.assertIs(record['load_attempted'], True)
+                self.assertIs(record['load_observed'], False)
+                self.assertEqual(record['loaded'], [])
+                for present in (True, False):
+                    if not present:
+                        host.loaded = ['unrelated (enforce)']
+                    with self.assertRaisesRegex(sandbox.Refused, 'cleanup_unowned_profile'):
+                        sandbox.cleanup()
+                    self.assertEqual(sandbox.read_journal(), record)
+                    self.assertTrue(sandbox.BWRAP.exists())
+                    self.assertTrue(sandbox.PROFILE.exists())
+                self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+
+    def test_cleanup_refuses_changed_or_duplicate_owned_attachments_before_any_removal(self):
+        for name in ('bwrap', 'unpriv_bwrap'):
+            for duplicate in (False, True):
+                with self.subTest(name=name, duplicate=duplicate), SimulatedLinux() as host:
+                    sandbox.apply()
+                    observed = host.attachments()
+                    if duplicate:
+                        observed.append((name, 'unexpected'))
+                    else:
+                        observed = [(key, 'unexpected' if key == name else value) for key, value in observed]
+                    with mock.patch.object(sandbox, 'attachments', return_value=observed):
+                        with self.assertRaisesRegex(sandbox.Refused, 'cleanup_attachment_changed'):
+                            sandbox.cleanup()
+                    self.assertFalse(any('-R' in argv for argv, _ in host.commands))
+                    self.assertTrue(sandbox.JOURNAL.exists())
+                    self.assertTrue(sandbox.PROFILE.exists())
+                    self.assertEqual(sandbox.cleanup()['cleanup'], 'PASS')
+
     def test_cleanup_refuses_tamper_and_preserves_recovery_record(self):
         for kind in ('binary', 'profile', 'restriction', 'unrelated_profile'):
             with self.subTest(kind=kind), SimulatedLinux() as host:
