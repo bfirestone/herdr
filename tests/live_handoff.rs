@@ -2242,6 +2242,7 @@ fn teardown_helper_process() {
     let Ok(mode) = std::env::var("HERDR_TEARDOWN_HELPER_MODE") else {
         return;
     };
+    eprintln!("teardown helper mode={mode}");
     let report = std::env::var_os("HERDR_TEARDOWN_HELPER_REPORT").unwrap();
     if mode == "term-resistant" {
         unsafe {
@@ -2483,7 +2484,11 @@ fn teardown_panic_subprocesses_leave_no_server() {
             assert!(Instant::now() < end, "nested {mode} exceeded deadline");
             thread::sleep(Duration::from_millis(20));
         };
-        assert_eq!(status.code(), Some(101), "nested panic must be observed");
+        assert_eq!(
+            status.code(),
+            Some(101),
+            "nested {mode}: panic must be observed"
+        );
         let records: Vec<serde_json::Value> =
             serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
         assert_eq!(
@@ -2492,7 +2497,8 @@ fn teardown_panic_subprocesses_leave_no_server() {
                 1
             } else {
                 2
-            }
+            },
+            "nested {mode}: exact controlpoint identity count"
         );
         let mut leaked = Vec::new();
         for record in records {
@@ -2591,7 +2597,10 @@ fn teardown_fixture_root_preserves_short_paths_and_rejects_long_override() {
 #[test]
 fn teardown_live_candidate_permission_failure_retains_fixture() {
     let _lock = test_lock();
-    for error in [libc::EPERM, libc::EACCES] {
+    let errors = [libc::EPERM, libc::EACCES];
+    #[cfg(target_os = "linux")]
+    let errors = [errors[0], errors[1], libc::ENOENT, libc::ESRCH];
+    for error in errors {
         let base = unique_test_dir();
         let helper_base = unique_test_dir();
         let report = helper_base.join("ready");
@@ -2607,6 +2616,99 @@ fn teardown_live_candidate_permission_failure_retains_fixture() {
             "live executable inspection error must fail cleanup"
         );
         assert!(retained, "incomplete inventory must retain fixture files");
+        base.finish().unwrap();
+    }
+}
+
+// These tests inject at the real /proc executable observation boundary. Their
+// control point runs only after an unchanged-birth ENOENT has become Pending.
+#[cfg(target_os = "linux")]
+#[test]
+fn teardown_linux_pending_producer_exit_is_reobserved_and_reaped() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let socket = base.join("runtime/herdr.sock");
+    let server = std::rc::Rc::new(std::cell::RefCell::new(spawn_server(
+        &base.join("config"),
+        &base.join("runtime"),
+        &socket,
+    )));
+    wait_for_socket(&socket, Duration::from_secs(10));
+    let identity = server.borrow().identity.as_ref().unwrap().clone();
+    let controlled = server.clone();
+    let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let recorded = observed.clone();
+    let expected = identity.clone();
+    base.inject_executable_failure(identity.pid, Some(libc::ENOENT));
+    support::on_linux_executable_pending(move || {
+        let exit = (|| -> std::io::Result<()> {
+            if controlled.borrow_mut().child.try_wait()?.is_some()
+                || support::test_process_birth(expected.pid)? != Some(expected.birth)
+            {
+                return Err(std::io::Error::other(
+                    "controlled producer changed before Pending",
+                ));
+            }
+            // The unreaped direct Child and matching birth establish this exact
+            // owned producer; the injection must never authorize this signal.
+            if unsafe { libc::kill(expected.pid as i32, libc::SIGKILL) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        *recorded.borrow_mut() = Some(exit);
+    });
+    let result = base.finish();
+    base.inject_executable_failure(identity.pid, None);
+    observed
+        .borrow_mut()
+        .take()
+        .expect("Pending control point reached")
+        .unwrap();
+    result.unwrap();
+    assert_ne!(
+        support::test_process_birth(identity.pid).unwrap(),
+        Some(identity.birth)
+    );
+    match server.borrow_mut().child.try_wait() {
+        Ok(Some(_)) => {}
+        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ECHILD)),
+        Ok(None) => panic!("controlled producer was not reaped"),
+    }
+    drop(server);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn teardown_linux_live_producer_metadata_failure_retains_ownership() {
+    let _lock = test_lock();
+    for errno in [libc::ENOENT, libc::ESRCH, libc::EACCES] {
+        let base = unique_test_dir();
+        let socket = base.join("runtime/herdr.sock");
+        let server = spawn_server(&base.join("config"), &base.join("runtime"), &socket);
+        wait_for_socket(&socket, Duration::from_secs(10));
+        let identity = server.identity.as_ref().unwrap();
+        base.inject_executable_failure(identity.pid, Some(errno));
+        let cleanup = base.finish();
+        let signaling =
+            support::terminate_test_process(identity, Instant::now() + Duration::from_millis(2400));
+        let retained = base.exists();
+        let current = support::test_process_birth(identity.pid);
+        base.inject_executable_failure(identity.pid, None);
+        assert!(cleanup
+            .unwrap_err()
+            .to_string()
+            .contains("mode=linux-pending"));
+        assert!(
+            signaling.is_err(),
+            "uncertain producer must never authorize TERM or KILL"
+        );
+        assert!(
+            retained,
+            "failed producer cleanup must retain fixture ownership/files"
+        );
+        assert_eq!(current.unwrap(), Some(identity.birth));
+        drop(server);
         base.finish().unwrap();
     }
 }

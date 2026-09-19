@@ -147,6 +147,15 @@ impl HandoffFixture {
 
     #[cfg(test)]
     pub fn inject_executable_failure(&self, pid: u32, error: Option<i32>) {
+        #[cfg(target_os = "linux")]
+        {
+            LINUX_EXECUTABLE_FAILURE.set(error.map(|error| (pid, error)));
+            if error.is_none() {
+                LINUX_PENDING_HOOK.with(|hook| {
+                    hook.borrow_mut().take();
+                });
+            }
+        }
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -506,6 +515,12 @@ fn retry_macos_inspection<T>(
 }
 
 fn process_executable(pid: u32) -> std::io::Result<PathBuf> {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some((target, errno)) = LINUX_EXECUTABLE_FAILURE.get() {
+        if target == pid {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -559,10 +574,188 @@ fn test_process_parent(pid: u32) -> std::io::Result<u32> {
     }
 }
 
-pub fn test_process_identity(pid: u32) -> std::io::Result<Option<TestProcessIdentity>> {
-    test_process_identity_from(pid, test_process_birth, process_executable)
+#[cfg(any(target_os = "linux", test))]
+struct LinuxExecutableObservation<'a> {
+    pid: u32,
+    birth: (u64, u64),
+    operation: &'a str,
+    deadline: Instant,
 }
 
+#[cfg(any(target_os = "linux", test))]
+impl LinuxExecutableObservation<'_> {
+    fn observe(
+        &self,
+        mut read_birth: impl FnMut(u32) -> std::io::Result<Option<(u64, u64)>>,
+        mut read_executable: impl FnMut(u32) -> std::io::Result<PathBuf>,
+        mut now: impl FnMut() -> Instant,
+        mut wait: impl FnMut(Duration),
+    ) -> std::io::Result<Option<PathBuf>> {
+        let started = now();
+        let end = self.deadline.min(started + Duration::from_millis(40));
+        let mut failure = None;
+        let mut latest = Some(self.birth);
+        let diagnostic = |reason: &str, latest, failure: &Option<std::io::Error>, time: Instant| {
+            bad_inspection(&format!(
+                "{} PID {} birth {:?}: mode=linux-pending latest_birth={latest:?} errno={:?} elapsed={:?}; {reason}; {}",
+                self.operation, self.pid, self.birth,
+                failure.as_ref().and_then(std::io::Error::raw_os_error),
+                time.saturating_duration_since(started),
+                failure.as_ref().map(ToString::to_string).unwrap_or_default(),
+            ))
+        };
+        for attempt in 0..=4 {
+            if now() >= self.deadline || (attempt > 0 && now() > end) {
+                return Err(diagnostic(
+                    "observation/caller deadline exhausted",
+                    latest,
+                    &failure,
+                    now(),
+                ));
+            }
+            latest = read_birth(self.pid).map_err(|error| {
+                diagnostic(
+                    &format!("birth read failed: {error}"),
+                    latest,
+                    &failure,
+                    now(),
+                )
+            })?;
+            if latest != Some(self.birth) {
+                return Ok(None);
+            }
+            let inspected = read_executable(self.pid);
+            // Always bracket metadata with the same captured birth. An errno
+            // or a Pending observation alone cannot establish disappearance.
+            let metadata = match inspected {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    failure = Some(error);
+                    None
+                }
+            };
+            latest = read_birth(self.pid).map_err(|error| {
+                diagnostic(
+                    &format!("birth recheck failed: {error}"),
+                    latest,
+                    &failure,
+                    now(),
+                )
+            })?;
+            if latest != Some(self.birth) {
+                return Ok(None);
+            }
+            if let Some(path) = metadata {
+                return Ok(Some(path));
+            }
+            let pending = matches!(
+                failure.as_ref().and_then(std::io::Error::raw_os_error),
+                Some(libc::ENOENT | libc::ESRCH)
+            );
+            if !pending || attempt == 4 || now() >= end {
+                return Err(diagnostic(
+                    "recorded identity remains live; observation unresolved",
+                    latest,
+                    &failure,
+                    now(),
+                ));
+            }
+            wait(Duration::from_millis(10).min(end.saturating_duration_since(now())));
+        }
+        unreachable!("bounded observation returns on its final probe")
+    }
+}
+
+pub fn test_process_identity(pid: u32) -> std::io::Result<Option<TestProcessIdentity>> {
+    test_process_identity_before(pid, Instant::now() + Duration::from_millis(40))
+}
+
+fn test_process_identity_before(
+    pid: u32,
+    deadline: Instant,
+) -> std::io::Result<Option<TestProcessIdentity>> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(birth) = test_process_birth(pid)? else {
+            return Ok(None);
+        };
+        Ok(observe_executable_before(
+            pid,
+            birth,
+            "identity executable",
+            deadline,
+            process_executable,
+        )?
+        .map(|executable| TestProcessIdentity {
+            pid,
+            birth,
+            executable,
+            import_socket: None,
+            runtime_dir: None,
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = deadline;
+        test_process_identity_from(pid, test_process_birth, process_executable)
+    }
+}
+
+fn observe_executable_before(
+    pid: u32,
+    birth: (u64, u64),
+    operation: &str,
+    deadline: Instant,
+    mut read_executable: impl FnMut(u32) -> std::io::Result<PathBuf>,
+) -> std::io::Result<Option<PathBuf>> {
+    #[cfg(target_os = "linux")]
+    {
+        LinuxExecutableObservation {
+            pid,
+            birth,
+            operation,
+            deadline,
+        }
+        .observe(
+            test_process_birth,
+            &mut read_executable,
+            Instant::now,
+            |delay| {
+                #[cfg(test)]
+                LINUX_PENDING_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                thread::sleep(delay);
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = deadline;
+        resolve_identity_inspection(
+            pid,
+            birth,
+            operation,
+            read_executable(pid),
+            test_process_birth,
+        )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static LINUX_EXECUTABLE_FAILURE: std::cell::Cell<Option<(u32, i32)>> = const { std::cell::Cell::new(None) };
+    static LINUX_PENDING_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub fn on_linux_executable_pending(hook: impl FnOnce() + 'static) {
+    LINUX_PENDING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
 fn test_process_identity_from(
     pid: u32,
     mut read_birth: impl FnMut(u32) -> std::io::Result<Option<(u64, u64)>>,
@@ -642,7 +835,7 @@ fn settled_herdr_identity_before(
                 "child executable settlement deadline exceeded",
             ));
         }
-        let Some(identity) = test_process_identity(pid)? else {
+        let Some(identity) = test_process_identity_before(pid, deadline)? else {
             return Ok(None);
         };
         if identity.birth != birth {
@@ -838,19 +1031,16 @@ fn discover_imports(
             continue;
         }
         // Inspect argv only after the kernel executable matches our Cargo binary.
-        let inspected = process_executable(pid);
-        #[cfg(test)]
-        let inspected = match ownership.executable_failure {
-            Some((target, error)) if target == pid => Err(std::io::Error::from_raw_os_error(error)),
-            _ => inspected,
-        };
-        let Some(executable) = resolve_identity_inspection(
-            pid,
-            birth,
-            "executable inventory",
-            inspected,
-            test_process_birth,
-        )?
+        let Some(executable) =
+            observe_executable_before(pid, birth, "executable inventory", deadline, |pid| {
+                #[cfg(all(test, not(target_os = "linux")))]
+                if let Some((target, error)) = ownership.executable_failure {
+                    if target == pid {
+                        return Err(std::io::Error::from_raw_os_error(error));
+                    }
+                }
+                process_executable(pid)
+            })?
         else {
             continue;
         };
@@ -858,7 +1048,7 @@ fn discover_imports(
             continue;
         }
         let result: std::io::Result<Option<TestProcessIdentity>> = (|| {
-            let Some(mut identity) = test_process_identity(pid)? else {
+            let Some(mut identity) = test_process_identity_before(pid, deadline)? else {
                 return Ok(None);
             };
             if identity.birth != birth || !is_test_herdr_binary(&identity.executable) {
@@ -921,10 +1111,13 @@ fn same_process(expected: &TestProcessIdentity, current: Option<&TestProcessIden
     })
 }
 
-fn identity_still_owned(identity: &TestProcessIdentity) -> std::io::Result<bool> {
+fn identity_still_owned_before(
+    identity: &TestProcessIdentity,
+    deadline: Instant,
+) -> std::io::Result<bool> {
     identity_still_owned_from(
         identity,
-        test_process_identity,
+        |pid| test_process_identity_before(pid, deadline),
         test_process_birth,
         process_runtime_dir,
         read_cmdline,
@@ -990,8 +1183,13 @@ pub fn terminate_test_process(
         (libc::SIGTERM, Duration::from_millis(400)),
         (libc::SIGKILL, Duration::from_secs(2)),
     ] {
+        let end = deadline.min(Instant::now() + grace);
+        if Instant::now() >= end {
+            break;
+        }
         // Never signal a reused PID, a changed executable, or a changed import.
-        if identity_still_owned(identity)?
+        if identity_still_owned_before(identity, end)?
+            && Instant::now() < end
             && unsafe { libc::kill(identity.pid as i32, signal) } != 0
         {
             let e = std::io::Error::last_os_error();
@@ -1002,19 +1200,23 @@ pub fn terminate_test_process(
                 )));
             }
         }
-        let end = deadline.min(Instant::now() + grace);
         loop {
             let mut status = 0;
             unsafe {
                 libc::waitpid(identity.pid as i32, &mut status, libc::WNOHANG);
             }
-            if !identity_still_owned(identity)? {
+            if Instant::now() >= end {
+                break;
+            }
+            if !identity_still_owned_before(identity, end)? {
                 return Ok(());
             }
             if Instant::now() >= end {
                 break;
             }
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(
+                Duration::from_millis(20).min(end.saturating_duration_since(Instant::now())),
+            );
         }
     }
     Err(bad_inspection(&format!(
@@ -1080,7 +1282,7 @@ fn finish_handoff_fixture(state: &FixtureState) -> std::io::Result<()> {
         ));
     }
     for producer in ownership.producers.clone() {
-        if identity_still_owned(&producer)
+        if identity_still_owned_before(&producer, deadline)
             .map_err(|error| bad_inspection(&format!("producer inspection: {error}")))?
         {
             ownership.terminated_servers += 1;
@@ -1090,7 +1292,7 @@ fn finish_handoff_fixture(state: &FixtureState) -> std::io::Result<()> {
         unregister_spawned_herdr_pid(Some(producer.pid));
     }
     for import in ownership.imports.clone() {
-        if identity_still_owned(&import)
+        if identity_still_owned_before(&import, deadline)
             .map_err(|error| bad_inspection(&format!("recorded import inspection: {error}")))?
         {
             ownership.terminated_servers += 1;
@@ -1125,7 +1327,7 @@ fn finish_handoff_fixture(state: &FixtureState) -> std::io::Result<()> {
         } else {
             empty_scans = 0;
             for import in imports {
-                if identity_still_owned(&import).map_err(|error| {
+                if identity_still_owned_before(&import, deadline).map_err(|error| {
                     bad_inspection(&format!("discovered import inspection: {error}"))
                 })? {
                     ownership.terminated_servers += 1;
@@ -1747,13 +1949,40 @@ fn guarded_handoff_runtime(runtime: &Path) -> bool {
     fixture_registry().contains_key(runtime.parent().unwrap_or(runtime))
 }
 
+fn unguarded_runtime_identities_from(
+    requested: &HashSet<PathBuf>,
+    mut guarded: impl FnMut(&Path) -> bool,
+    inventory: impl FnOnce() -> std::io::Result<Vec<TestProcessIdentity>>,
+) -> std::io::Result<Vec<TestProcessIdentity>> {
+    let requested: HashSet<_> = requested
+        .iter()
+        .filter(|runtime| !guarded(runtime))
+        .collect();
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(inventory()?
+        .into_iter()
+        .filter(|identity| {
+            identity
+                .runtime_dir
+                .as_ref()
+                .is_some_and(|runtime| requested.contains(runtime))
+        })
+        .collect())
+}
+
 fn cleanup_servers_with_missing_runtime_dir() -> std::io::Result<()> {
     let registered_runtime_dirs = registered_runtime_dirs_snapshot();
     if registered_runtime_dirs.is_empty() {
         return Ok(());
     }
 
-    for identity in runtime_server_identities()? {
+    for identity in unguarded_runtime_identities_from(
+        &registered_runtime_dirs,
+        guarded_handoff_runtime,
+        runtime_server_identities,
+    )? {
         let runtime = identity
             .runtime_dir
             .as_ref()
@@ -1771,7 +2000,11 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
     if runtime_dirs.is_empty() {
         return;
     }
-    let identities = match runtime_server_identities() {
+    let identities = match unguarded_runtime_identities_from(
+        runtime_dirs,
+        guarded_handoff_runtime,
+        runtime_server_identities,
+    ) {
         Ok(identities) => identities,
         Err(error) => {
             eprintln!("runtime inventory unresolved: {error}");
@@ -1820,6 +2053,7 @@ fn runtime_identity_from(
 }
 
 fn runtime_server_identities() -> std::io::Result<Vec<TestProcessIdentity>> {
+    let deadline = Instant::now() + Duration::from_secs(2);
     let proc_entries = match fs::read_dir("/proc") {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1827,6 +2061,9 @@ fn runtime_server_identities() -> std::io::Result<Vec<TestProcessIdentity>> {
     };
     let mut identities = Vec::new();
     for entry in proc_entries {
+        if Instant::now() >= deadline {
+            return Err(bad_inspection("runtime inventory deadline exceeded"));
+        }
         let entry = entry?;
         let Some(pid) = entry
             .file_name()
@@ -1848,12 +2085,16 @@ fn runtime_server_identities() -> std::io::Result<Vec<TestProcessIdentity>> {
                 Err(error) => return Err(error),
             }
         }
-        let result = runtime_identity_from(pid, test_process_identity, |pid| {
-            if !read_cmdline(pid)?.iter().any(|arg| arg == "server") {
-                return Ok(None);
-            }
-            process_runtime_dir(pid)
-        });
+        let result = runtime_identity_from(
+            pid,
+            |pid| test_process_identity_before(pid, deadline),
+            |pid| {
+                if !read_cmdline(pid)?.iter().any(|arg| arg == "server") {
+                    return Ok(None);
+                }
+                process_runtime_dir(pid)
+            },
+        );
         match result {
             Ok(Some(identity)) => identities.push(identity),
             Ok(None) => {}
@@ -1943,6 +2184,203 @@ fn process_exists(pid: libc::pid_t) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_runtime_filter_skips_irrelevant_inventory_and_preserves_errors() {
+        let guarded = PathBuf::from("/guarded/runtime");
+        let plain = PathBuf::from("/plain/runtime");
+        let result = unguarded_runtime_identities_from(
+            &HashSet::from([guarded.clone()]),
+            |_| true,
+            || panic!("guarded-only runtime must not run global inventory"),
+        )
+        .unwrap();
+        assert!(result.is_empty());
+        let mut first = inspection_identity();
+        first.runtime_dir = Some(guarded.clone());
+        let mut second = inspection_identity();
+        second.runtime_dir = Some(plain.clone());
+        let requested = HashSet::from([guarded.clone(), plain.clone()]);
+        let result = unguarded_runtime_identities_from(
+            &requested,
+            |path| path == guarded,
+            || Ok(vec![first, second.clone()]),
+        )
+        .unwrap();
+        assert_eq!(result, [second]);
+        let result = unguarded_runtime_identities_from(
+            &requested,
+            |path| path == guarded,
+            || Err(bad_inspection("same-birth metadata unresolved")),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("same-birth metadata unresolved"));
+    }
+
+    #[test]
+    fn linux_pending_executable_observes_transition_and_rechecks_success() {
+        for outcome in 0..4 {
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let reads = std::cell::Cell::new(0);
+            let mut births = 0;
+            let result = LinuxExecutableObservation {
+                pid: 42,
+                birth: (123, 4),
+                operation: "test executable",
+                deadline: start + Duration::from_secs(1),
+            }
+            .observe(
+                |_| {
+                    births += 1;
+                    Ok(if reads.get() > 0 && outcome < 2 && births >= 3 {
+                        if outcome == 0 {
+                            None
+                        } else {
+                            Some((124, 4))
+                        }
+                    } else if outcome == 3 && reads.get() == 2 {
+                        Some((124, 4))
+                    } else {
+                        Some((123, 4))
+                    })
+                },
+                |_| {
+                    reads.set(reads.get() + 1);
+                    if reads.get() == 1 {
+                        Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+                    } else {
+                        Ok(PathBuf::from("/cargo/herdr"))
+                    }
+                },
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                (outcome == 2).then(|| PathBuf::from("/cargo/herdr"))
+            );
+            assert_eq!(reads.get(), if outcome < 2 { 1 } else { 2 });
+            assert_eq!(clock.get() - start, Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn linux_pending_executable_budget_and_live_errors_fail_closed() {
+        for (errno, cap, waits) in [
+            (libc::ENOENT, 100, 4),
+            (libc::ESRCH, 100, 4),
+            (libc::ENOENT, 15, 2),
+            (libc::ENOENT, 0, 0),
+            (libc::EACCES, 100, 0),
+            (libc::EPERM, 100, 0),
+            (libc::EIO, 100, 0),
+        ] {
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let count = std::cell::Cell::new(0);
+            let probe = LinuxExecutableObservation {
+                pid: 42,
+                birth: (123, 4),
+                operation: "test executable",
+                deadline: start + Duration::from_millis(cap),
+            };
+            let run = || {
+                probe.observe(
+                    |_| Ok(Some((123, 4))),
+                    |_| Err(std::io::Error::from_raw_os_error(errno)),
+                    || clock.get(),
+                    |delay| {
+                        count.set(count.get() + 1);
+                        clock.set(clock.get() + delay);
+                    },
+                )
+            };
+            let error = run().unwrap_err().to_string();
+            assert_eq!(count.get(), waits, "{error}");
+            assert_eq!(
+                clock.get() - start,
+                Duration::from_millis(if waits == 0 { 0 } else { cap.min(40) })
+            );
+            assert!(error.contains("PID 42 birth (123, 4)"), "{error}");
+            assert!(error.contains("elapsed"), "{error}");
+            assert!(!error.contains("PRIVATE_TOKEN"));
+            if cap <= 40 {
+                run().unwrap_err();
+                assert_eq!(
+                    count.get(),
+                    waits,
+                    "expired caller deadline must not reset per process"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linux_pending_executable_does_not_probe_after_delayed_wakeup() {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let reads = std::cell::Cell::new(0);
+        let result = LinuxExecutableObservation {
+            pid: 42,
+            birth: (123, 4),
+            operation: "test executable",
+            deadline: start + Duration::from_secs(1),
+        }
+        .observe(
+            |_| Ok(Some((123, 4))),
+            |_| {
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+                } else {
+                    Ok(PathBuf::from("/cargo/herdr"))
+                }
+            },
+            || clock.get(),
+            |_| clock.set(start + Duration::from_millis(41)),
+        );
+        assert!(
+            result.is_err(),
+            "scheduler delay must not extend the observation cap"
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn linux_pending_executable_birth_errors_never_grant_metadata() {
+        for failed_read in 1..=3 {
+            let mut count = 0;
+            let start = Instant::now();
+            let clock = std::cell::Cell::new(start);
+            let result = LinuxExecutableObservation {
+                pid: 42,
+                birth: (123, 4),
+                operation: "test executable",
+                deadline: start + Duration::from_secs(1),
+            }
+            .observe(
+                |_| {
+                    count += 1;
+                    if count == failed_read {
+                        Err(bad_inspection("malformed stat or unavailable birth"))
+                    } else {
+                        Ok(Some((123, 4)))
+                    }
+                },
+                |_| Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("malformed stat or unavailable birth"));
+        }
+    }
 
     #[test]
     fn handoff_ownership_rejects_wrong_paths_and_malformed_arguments() {
