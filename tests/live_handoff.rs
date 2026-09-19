@@ -110,11 +110,45 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn fixture_root(temporary_root: &Path, explicit_root: Option<&Path>) -> std::io::Result<PathBuf> {
+    // Ordinary macOS TMPDIR is too long for named-session handoff sockets.
+    // A supervisor override is explicit: reject invalid/long roots, never escape
+    // that supervisor's exclusively owned directory by silently falling back.
+    let _ = temporary_root;
+    let root = explicit_root.unwrap_or(Path::new("/tmp"));
+    if !root.is_absolute()
+        || root.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(std::io::Error::other(
+            "fixture root must be absolute without traversal",
+        ));
+    }
+    let canonical = fs::canonicalize(root)?;
+    let tail = "h2147483647-9999/config/herdr-dev/sessions/work/herdr-handoff-2147483647.sock";
+    // macOS sun_path is 104 bytes including the terminator. The short fixture
+    // counter is separately bounded below, so budget its actual maximum here.
+    if canonical.join(tail).as_os_str().as_encoded_bytes().len() >= 104 {
+        return Err(std::io::Error::other(
+            "fixture root exceeds handoff socket path budget",
+        ));
+    }
+    Ok(root.to_path_buf())
+}
+
 fn unique_test_dir() -> support::HandoffFixture {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let explicit = std::env::var_os("HERDR_HANDOFF_FIXTURE_ROOT").map(PathBuf::from);
+    let root =
+        fixture_root(&std::env::temp_dir(), explicit.as_deref()).expect("valid short fixture root");
     loop {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("h{}-{n}", std::process::id()));
+        assert!(n <= 9999, "fixture counter exceeded socket path budget");
+        let base = root.join(format!("h{}-{n}", std::process::id()));
         match support::HandoffFixture::create(base) {
             Ok(fixture) => return fixture,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -143,8 +177,20 @@ fn spawn_owned_server(
         config_home: config_home.to_path_buf(),
     };
     let pid = spawned.child.process_id().expect("server PID");
-    if std::env::var("HERDR_TEARDOWN_HELPER_MODE").as_deref() == Ok("panic-before-registration") {
+    if std::env::var("HERDR_TEARDOWN_HELPER_MODE").as_deref() == Ok("hold-before-journal") {
         let birth = support::test_process_birth(pid).unwrap().unwrap();
+        let report = std::env::var_os("HERDR_TEARDOWN_HELPER_REPORT").unwrap();
+        fs::write(
+            report,
+            serde_json::to_vec(&[serde_json::json!({"pid": pid, "birth": birth})]).unwrap(),
+        )
+        .unwrap();
+        hold_for_parent_failure();
+    }
+    if std::env::var("HERDR_TEARDOWN_HELPER_MODE").as_deref() == Ok("panic-before-registration") {
+        let identity = support::settled_herdr_identity(pid).unwrap().unwrap();
+        support::record_handoff_producer(config_home, &identity).expect("record startup producer");
+        let birth = identity.birth;
         let report = std::env::var_os("HERDR_TEARDOWN_HELPER_REPORT").unwrap();
         fs::write(
             report,
@@ -2214,8 +2260,18 @@ fn teardown_helper_process() {
             | "panic-before-readiness"
             | "panic-before-response"
             | "panic-before-registration"
+            | "hold-after-handoff"
+            | "hold-before-readiness"
+            | "hold-before-journal"
     ));
-    let base = unique_test_dir();
+    let base = support::HandoffFixture::borrow_from_parent(
+        PathBuf::from(std::env::var_os("HERDR_TEARDOWN_FIXTURE").unwrap()),
+        std::env::var("HERDR_TEARDOWN_PARENT")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .unwrap();
     let config = base.join("config");
     let runtime = base.join("runtime");
     let socket = runtime.join("herdr.sock");
@@ -2223,6 +2279,9 @@ fn teardown_helper_process() {
     let original = server.identity.as_ref().unwrap().clone();
     let mut identities = vec![serde_json::json!({"pid": original.pid, "birth": original.birth})];
     fs::write(&report, serde_json::to_vec(&identities).unwrap()).unwrap();
+    if mode == "hold-before-readiness" {
+        hold_for_parent_failure();
+    }
     if mode == "panic-before-readiness" {
         panic!("injected failure before readiness assertion");
     }
@@ -2253,18 +2312,68 @@ fn teardown_helper_process() {
         .unwrap();
     identities.push(serde_json::json!({"pid": replacement.pid, "birth": replacement.birth}));
     fs::write(report, serde_json::to_vec(&identities).unwrap()).unwrap();
+    if mode == "hold-after-handoff" {
+        hold_for_parent_failure();
+    }
     panic!("injected failure after replacement identity observed");
 }
 
-struct TeardownChild(std::process::Child);
-impl Drop for TeardownChild {
-    fn drop(&mut self) {
+fn hold_for_parent_failure() -> ! {
+    let end = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < end {
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("parent failed to exercise bounded early-failure cleanup");
+}
+
+struct TeardownChild(std::process::Child, Option<support::HandoffFixture>);
+impl TeardownChild {
+    fn capture_before_reap(&mut self) -> std::io::Result<bool> {
+        if self.1.is_none() || self.0.try_wait()?.is_some() {
+            return Ok(false);
+        }
+        // try_wait has not reaped: this handle still owns the positive child PID.
+        let pid = self.0.id() as i32;
+        if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let end = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if waited == pid {
+                if libc::WIFSTOPPED(status) {
+                    break;
+                }
+                // A process that exited before STOP cannot create another child;
+                // keep any pending-startup marker because ancestry is now lost.
+                return Ok(false);
+            }
+            if waited < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if Instant::now() >= end {
+                return Err(std::io::Error::other(
+                    "nested helper did not stop before inventory",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.1
+            .as_ref()
+            .unwrap()
+            .capture_stopped_helper_children(self.0.id())?;
+        Ok(true)
+    }
+
+    fn reap_helper(&mut self) -> bool {
         match self.0.try_wait() {
-            Ok(Some(_)) => return,
-            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return,
+            Ok(Some(_)) => return true,
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return true,
             Err(error) => {
                 eprintln!("nested child inspection unresolved: {error}");
-                return;
+                return false;
             }
             Ok(None) => {}
         }
@@ -2274,22 +2383,82 @@ impl Drop for TeardownChild {
         while Instant::now() < end {
             match self.0.try_wait() {
                 Ok(None) => thread::sleep(Duration::from_millis(20)),
-                _ => return,
+                Ok(Some(_)) => return true,
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return true,
+                Err(error) => {
+                    eprintln!("nested child reaping unresolved: {error}");
+                    return false;
+                }
             }
         }
         eprintln!("nested child {} did not reap before deadline", self.0.id());
+        false
+    }
+}
+
+impl Drop for TeardownChild {
+    fn drop(&mut self) {
+        let captured = self.capture_before_reap();
+        if !self.reap_helper() {
+            if thread::panicking() {
+                eprintln!("nested helper unresolved; fixture ownership retained");
+            } else {
+                panic!("nested helper unresolved; fixture ownership retained");
+            }
+            return;
+        }
+        if let Some(fixture) = &self.1 {
+            let capture_error = match captured {
+                Ok(true) => fixture.clear_reaped_helper_startup().err(),
+                Ok(false) => None,
+                Err(error) => Some(error),
+            };
+            fixture.set_nested_helper_active(false);
+            if let Some(error) = capture_error {
+                support::retain_handoff_startup_failure(
+                    &fixture.join("config"),
+                    &error.to_string(),
+                );
+            }
+            // The fixture guard reads its private producer journal and scans its
+            // pre-registered import directories even when the success report is
+            // missing/malformed, or the parent times out before parsing it.
+            if let Err(error) = fixture.finish() {
+                if thread::panicking() {
+                    eprintln!("nested emergency cleanup unresolved: {error}");
+                } else {
+                    panic!("nested emergency cleanup unresolved: {error}");
+                }
+            }
+            if fixture.terminated_servers() != 0 {
+                if thread::panicking() {
+                    eprintln!(
+                        "nested parent recovered live servers; nested scenario remains failed"
+                    );
+                } else {
+                    panic!(
+                        "nested parent recovered live servers; emergency cleanup is a failed gate"
+                    );
+                }
+            }
+        }
     }
 }
 
 fn spawn_teardown_child(mode: &str, report: &Path) -> TeardownChild {
-    let child = TeardownChild(
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["teardown_helper_process", "--exact", "--nocapture"])
-            .env("HERDR_TEARDOWN_HELPER_MODE", mode)
-            .env("HERDR_TEARDOWN_HELPER_REPORT", report)
-            .spawn()
-            .unwrap(),
-    );
+    let fixture = (mode != "term-resistant").then(unique_test_dir);
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["teardown_helper_process", "--exact", "--nocapture"])
+        .env("HERDR_TEARDOWN_HELPER_MODE", mode)
+        .env("HERDR_TEARDOWN_HELPER_REPORT", report);
+    if let Some(fixture) = &fixture {
+        fixture.set_nested_helper_active(true);
+        command
+            .env("HERDR_TEARDOWN_FIXTURE", fixture.as_ref())
+            .env("HERDR_TEARDOWN_PARENT", std::process::id().to_string());
+    }
+    let child = TeardownChild(command.spawn().unwrap(), fixture);
     support::record_teardown_helper(child.0.id());
     child
 }
@@ -2405,4 +2574,165 @@ fn teardown_inspection_failure_retains_fixture_and_unwind_does_not_double_panic(
     support::clear_handoff_inspection_failure(&path);
     cleanup_test_base(&path);
     assert!(!path.exists());
+}
+
+#[test]
+fn teardown_fixture_root_preserves_short_paths_and_rejects_long_override() {
+    let long = Path::new("/var/folders/b8/k03256lx2mzbvjm5dhy_kj4c0000gn/T");
+    assert_eq!(fixture_root(long, None).unwrap(), Path::new("/tmp"));
+    assert!(fixture_root(long, Some(long)).is_err());
+    assert!(fixture_root(long, Some(Path::new("relative"))).is_err());
+    assert_eq!(
+        fixture_root(long, Some(Path::new("/tmp"))).unwrap(),
+        Path::new("/tmp")
+    );
+}
+
+#[test]
+fn teardown_live_candidate_permission_failure_retains_fixture() {
+    let _lock = test_lock();
+    for error in [libc::EPERM, libc::EACCES] {
+        let base = unique_test_dir();
+        let helper_base = unique_test_dir();
+        let report = helper_base.join("ready");
+        let child = spawn_teardown_child("term-resistant", &report);
+        support::wait_for_file(&report, Duration::from_secs(5));
+        base.inject_executable_failure(child.0.id(), Some(error));
+        let result = base.finish();
+        let retained = base.exists();
+        base.inject_executable_failure(child.0.id(), None);
+        drop(child);
+        assert!(
+            result.is_err(),
+            "live executable inspection error must fail cleanup"
+        );
+        assert!(retained, "incomplete inventory must retain fixture files");
+        base.finish().unwrap();
+    }
+}
+
+#[test]
+fn teardown_parent_early_failures_clean_nested_producers_and_replacements() {
+    let _lock = test_lock();
+    for mode in [
+        "hold-before-journal",
+        "hold-before-readiness",
+        "hold-after-handoff",
+    ] {
+        for failure in [
+            "timeout",
+            "missing-report",
+            "malformed-report",
+            "record-count",
+        ] {
+            let base = unique_test_dir();
+            let report = base.join("child-report.json");
+            let child = spawn_teardown_child(mode, &report);
+            let fixture_path = child.1.as_ref().unwrap().to_path_buf();
+            let end = Instant::now() + Duration::from_secs(12);
+            let expected = if mode != "hold-after-handoff" { 1 } else { 2 };
+            let records: Vec<serde_json::Value> = loop {
+                if let Ok(bytes) = fs::read(&report) {
+                    if let Ok(records) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+                        if records.len() == expected {
+                            break records;
+                        }
+                    }
+                }
+                assert!(
+                    Instant::now() < end,
+                    "nested helper did not reach failure control point"
+                );
+                thread::sleep(Duration::from_millis(20));
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _owned_child = child;
+                match failure {
+                    "timeout" => panic!("injected parent deadline after helper control point"),
+                    "missing-report" => {
+                        fs::remove_file(&report).unwrap();
+                        fs::read(&report).unwrap();
+                    }
+                    "malformed-report" => {
+                        fs::write(&report, b"incomplete").unwrap();
+                        serde_json::from_slice::<Vec<serde_json::Value>>(
+                            &fs::read(&report).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    _ => assert_eq!(records.len(), 99, "injected unexpected record count"),
+                }
+            }));
+            assert!(
+                result.is_err(),
+                "emergency recovery must remain a failed nested scenario"
+            );
+            assert!(
+                !fixture_path.exists(),
+                "parent guard did not finish its fixture"
+            );
+            for record in records {
+                let pid = record["pid"].as_u64().unwrap() as u32;
+                let birth = (
+                    record["birth"][0].as_u64().unwrap(),
+                    record["birth"][1].as_u64().unwrap(),
+                );
+                assert_ne!(
+                    support::test_process_birth(pid).unwrap(),
+                    Some(birth),
+                    "nested server survived parent failure"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn teardown_incomplete_parent_journal_retains_ownership_and_cleans_known_servers() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    let socket = runtime.join("herdr.sock");
+    let server = spawn_server(&config, &runtime, &socket);
+    wait_for_socket(&socket, Duration::from_secs(10));
+    assert_ok(request(
+        &socket,
+        serde_json::json!({"id":"journal:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    let pid = wait_for_replacement_server_pid(
+        &runtime,
+        server.identity.as_ref().unwrap().pid,
+        Duration::from_secs(5),
+    );
+    let replacement = support::test_process_identity(pid).unwrap().unwrap();
+    let journal = base.join("producers.jsonl");
+    let intact = fs::read(&journal).unwrap();
+    for corrupt in [b"incomplete".as_slice(), b"".as_slice()] {
+        if corrupt.is_empty() {
+            fs::remove_file(&journal).unwrap();
+        } else {
+            fs::write(&journal, corrupt).unwrap();
+        }
+        assert!(base.finish().is_err());
+        assert!(
+            base.exists(),
+            "incomplete ownership must retain fixture files"
+        );
+        assert_ne!(
+            support::test_process_birth(pid).unwrap(),
+            Some(replacement.birth),
+            "known import was not cleaned despite journal failure"
+        );
+        fs::write(&journal, &intact).unwrap();
+    }
+    fs::write(base.join("pending-startup"), b"unrecorded child startup").unwrap();
+    assert!(
+        base.finish().is_err(),
+        "unrecorded startup cannot be declared quiescent"
+    );
+    assert!(base.exists());
+    fs::remove_file(base.join("pending-startup")).unwrap();
+    drop(server);
+    base.finish().unwrap();
 }
