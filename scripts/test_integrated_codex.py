@@ -562,6 +562,9 @@ class DirectProvider:
         while request_id not in self.responses:
             self.observe(deadline)
         frame = self.responses.pop(request_id)
+        evidence = self.__dict__.get('candidate_evidence')
+        if evidence is not None:
+            evidence.received(self, request_id, frame)
         if 'error' in frame:
             raise ProofFailure('fixture_provider_request_error')
         return frame['result']
@@ -679,6 +682,85 @@ def runtime_probe_observation(result=None, outcome='not_run'):
     return {'exit_code': runtime_exit_code(result), 'outcome': outcome,
             'stdout': runtime_output_metadata(response, 'stdout'),
             'stderr': runtime_output_metadata(response, 'stderr')}
+
+
+
+# Public candidate evidence accepts these literal harness categories only. Live
+# model/consent/API failures are deliberately outside this fixture-only schema.
+FIXTURE_DIAGNOSTICS = frozenset({
+    'fixture_initialize_version_mismatch', 'fixture_unexpected_authenticated_account',
+    'fixture_provider_deadline', 'fixture_provider_exited', 'fixture_provider_request_error',
+    'fixture_input_bound', 'fixture_output_bound', 'fixture_stderr_bound', 'fixture_pending_bound',
+    'fixture_malformed_result', 'fixture_tool_failed_null', 'fixture_tool_failed_pipe', 'fixture_tool_failed_pty',
+    'fixture_tool_input_mismatch', 'provider_control_fd_inherited',
+    'fixture_enforcement_malformed', 'fixture_enforcement_not_proven',
+    'fixture_candidate_environment', 'fixture_candidate_not_first', 'fixture_candidate_ineligible',
+    'fixture_denial_target_invalid', 'fixture_parent_write_control', 'fixture_parent_network_control',
+    'fixture_outside_canary_changed', 'fixture_listener_reached',
+    'owned_hook_not_discovered', 'owned_hook_hash_not_trusted', 'fixture_hook_stop_not_observed',
+    'fixture_unexpected_model_or_tool_output', 'fixture_child_not_observed_hook_fd_isolation',
+    'fixture_child_not_observed_mcp_fd_isolation', 'fixture_child_wrong_input', 'fixture_timeout',
+    'fixture_owned_tree_cleanup', 'fixture_owned_child_cleanup', 'fixture_unexpected_exit_cleanup_unverified',
+    'owned_cleanup_unverified', 'owned_descendant_cleanup_unverified', 'process_inspection_unavailable',
+})
+CANDIDATE_FAILURE_STAGES = frozenset({
+    'initialization', 'null_request', 'null_response', 'null_descriptor_input',
+    'pipe_request', 'pipe_wait_ready', 'pipe_write', 'pipe_response', 'pipe_descriptor_input',
+    'pty_request', 'pty_wait_ready', 'pty_write', 'pty_response', 'pty_descriptor_input',
+    'enforcement_setup', 'enforcement_request', 'enforcement_response', 'enforcement_check',
+    'tool_cleanup', 'hook_mcp_initialization', 'hook_setup', 'hook_cleanup',
+    'hook_mcp_trusted_initialization', 'hook_trust_setup', 'hook_mcp_thread_request',
+    'hook_mcp_turn_request', 'hook_mcp_wait_receipt', 'hook_check', 'hook_receipt', 'mcp_receipt', 'cleanup',
+})
+
+
+class CandidateFailureEvidence:
+    """Observe one owned command from memory; never request, read, or wait."""
+    def __init__(self):
+        self.stage = 'initialization'
+        self.tool_modes = dict.fromkeys(('null', 'pipe', 'pty'), False)
+        self.clear_command()
+
+    def clear_command(self):
+        self.client = None
+        self.request_id = None
+        self.command = {'presence': 'not_observed', 'validity': 'unknown',
+                        'runtime': runtime_probe_observation(outcome='not_observed')}
+
+    def activate(self, client, request_id):
+        self.clear_command()
+        self.client = client
+        self.request_id = request_id
+
+    def received(self, client, request_id, frame):
+        # A cache lookup alone is not correlation: also require the frame's ID.
+        if (client is not self.client or self.request_id is None or request_id != self.request_id or
+                not isinstance(frame, dict) or frame.get('id') != self.request_id or 'method' in frame):
+            return
+        result = frame.get('result')
+        valid = (isinstance(result, dict) and runtime_exit_code(result) is not None and
+                 all(key not in result or isinstance(result[key], str) for key in ('stdout', 'stderr')))
+        outcome = 'response' if valid else 'malformed_result'
+        if 'error' in frame:
+            error = frame['error']
+            valid = (isinstance(error, dict) and type(error.get('code')) is int and
+                     -(2 ** 31) <= error['code'] < 2 ** 31 and isinstance(error.get('message'), str) and
+                     'result' not in frame)
+            outcome = 'rpc_error' if valid else 'malformed_result'
+            result = None
+        self.command = {'presence': 'observed', 'validity': 'valid' if valid else 'malformed',
+                        'runtime': runtime_probe_observation(result, outcome)}
+
+    def failure(self, diagnostic):
+        # A terminal response may already be cached while waitREADY still waits.
+        # Read only that dict entry; do not consume it or inspect notifications.
+        if self.client is not None and self.request_id is not None:
+            frames = self.client.__dict__.get('responses')
+            if isinstance(frames, dict) and self.request_id in frames:
+                self.received(self.client, self.request_id, frames[self.request_id])
+        return {'stage': self.stage if self.stage in CANDIDATE_FAILURE_STAGES else 'unknown',
+                'diagnostic': diagnostic if type(diagnostic) is str and diagnostic in FIXTURE_DIAGNOSTICS else 'unclassified',
+                'tool_modes': dict(self.tool_modes), 'command': self.command}
 
 
 def diagnose_provider_runtime(client, root, python, original):
@@ -822,7 +904,7 @@ def enforcement_observation(result):
     return value
 
 
-def linux_enforcement(client, root, python):
+def linux_enforcement(client, root, python, evidence=None):
     # HOME is intentionally preserved by descriptor_environment. Use a NEW
     # private child of that directory, outside cwd and the /tmp writable roots.
     try:
@@ -857,9 +939,18 @@ def linux_enforcement(client, root, python):
                 connection.sendall(b'ok')
             if control.recv(2) != b'ok':
                 raise ProofFailure('fixture_parent_network_control')
+        if evidence is not None:
+            evidence.stage = 'enforcement_request'
+            evidence.clear_command()
         request = client.request('command/exec', {'command': [python, '-c', ENFORCEMENT_CHILD,
                                  str(canary), str(listener.getsockname()[1])], 'cwd': str(root), 'timeoutMs': 10000})
-        observation = enforcement_observation(client.response(request, timeout=30))
+        if evidence is not None:
+            evidence.activate(client, request)
+            evidence.stage = 'enforcement_response'
+        result = client.response(request, timeout=30)
+        if evidence is not None:
+            evidence.stage = 'enforcement_check'
+        observation = enforcement_observation(result)
         if canary.read_bytes() != b'owned-before':
             raise ProofFailure('fixture_outside_canary_changed')
         listener.settimeout(0.1)
@@ -889,11 +980,14 @@ def provider_fixtures(args):
     client = None
     providers = []
     owned_children = set()
+    evidence = CandidateFailureEvidence() if getattr(args, 'require_linux_enforcement', False) else None
     try:
         diagnose = getattr(args, 'diagnose_provider_runtime', False) and os.sys.platform == 'linux'
         if diagnose:
             report['runtime_environment'] = runtime_environment_metadata()
         client = DirectProvider(provider, root, owners=providers)
+        if evidence is not None:
+            client.candidate_evidence = evidence
         for mode in ('null', 'pipe', 'pty'):
             params = {'command': [python, str(script), mode, '-'], 'cwd': str(root), 'timeoutMs': 10000}
             process_id = 'owned-' + mode
@@ -901,13 +995,24 @@ def provider_fixtures(args):
                 params.update(processId=process_id, streamStdin=True, streamStdoutStderr=True)
             if mode == 'pty':
                 params.update(tty=True, size={'rows': 24, 'cols': 80})
+            if evidence is not None:
+                evidence.stage = mode + '_request'
+                evidence.clear_command()
             request_id = client.request('command/exec', params)
+            if evidence is not None:
+                evidence.activate(client, request_id)
             if mode != 'null':
+                if evidence is not None:
+                    evidence.stage = mode + '_wait_ready'
                 deadline = time.monotonic() + 10
                 while b'READY' not in client.output(process_id):
                     client.observe(deadline)
+                if evidence is not None:
+                    evidence.stage = mode + '_write'
                 client.call('command/exec/write', {'processId': process_id,
                             'deltaBase64': base64.b64encode(b'pty-ok' if mode == 'pty' else b'child-only').decode(), 'closeStdin': mode == 'pipe'})
+            if evidence is not None:
+                evidence.stage = mode + '_response'
             result = client.response(request_id)
             if diagnose and runtime_exit_code(result) is None:
                 raise ProofFailure('fixture_malformed_result')
@@ -916,15 +1021,24 @@ def provider_fixtures(args):
                 if diagnose and mode == 'null':
                     report['runtime_diagnostics'] = diagnose_provider_runtime(client, root, python, result)
                 raise ProofFailure('fixture_tool_failed_' + mode)
+            if evidence is not None:
+                evidence.stage = mode + '_descriptor_input'
             output = client.output(process_id).split(b'READY\n', 1)[-1] if mode != 'null' else result['stdout']
             observation = json.loads(output)
             assert_isolated(observation, client.control_identity)
             if observation['input'] != ('child-only' if mode == 'pipe' else 'pty-ok' if mode == 'pty' else ''):
                 raise ProofFailure('fixture_tool_input_mismatch')
+            if evidence is not None:
+                evidence.tool_modes[mode] = True
         if getattr(args, 'require_linux_enforcement', False):
-            report['linux_enforcement'] = linux_enforcement(client, root, python)
+            evidence.stage = 'enforcement_setup'
+            evidence.clear_command()
+            report['linux_enforcement'] = linux_enforcement(client, root, python, evidence)
         report['provider_authentication'] = 'PASS_no_account_empty_home'
         report['tool_fd_isolation'] = 'PASS_null_private_pipe_and_pty'
+        if evidence is not None:
+            evidence.stage = 'tool_cleanup'
+            evidence.clear_command()
         client.close()
         client = None
         hook_receipt = root / 'hook-descriptors.json'
@@ -935,7 +1049,11 @@ def provider_fixtures(args):
             'mcp_servers.herdr_descriptor={command=' + json.dumps(python) + ',args=' +
             json.dumps([str(script), 'mcp', str(mcp_receipt)]) + ',startup_timeout_sec=10}',
         ]
+        if evidence is not None:
+            evidence.stage = 'hook_mcp_initialization'
         client = DirectProvider(provider, root, overrides, owners=providers)
+        if evidence is not None:
+            evidence.stage = 'hook_setup'
         listed = client.call('hooks/list', {'cwds': [str(root)]})
         hooks = [hook for entry in listed['data'] for hook in entry['hooks']
                  if hook.get('command') == hook_command and hook.get('eventName') == 'sessionStart']
@@ -945,20 +1063,34 @@ def provider_fixtures(args):
         # Exactly one reviewed owned command's current hash. This is a process-local
         # CLI layer: no config-write RPC, user hook changes, or blanket bypass.
         overrides.append('hooks.state={' + json.dumps(hook['key']) + '={trusted_hash=' + json.dumps(hook['currentHash']) + '}}')
+        if evidence is not None:
+            evidence.stage = 'hook_cleanup'
         client.close()
+        if evidence is not None:
+            evidence.stage = 'hook_mcp_trusted_initialization'
         client = DirectProvider(provider, root, overrides, owners=providers)
+        if evidence is not None:
+            evidence.stage = 'hook_trust_setup'
         verified = client.call('hooks/list', {'cwds': [str(root)]})
         matches = [h for entry in verified['data'] for h in entry['hooks'] if h['key'] == hook['key']]
         if len(matches) != 1 or matches[0]['trustStatus'] != 'trusted' or matches[0]['currentHash'] != hook['currentHash']:
             raise ProofFailure('owned_hook_hash_not_trusted')
+        if evidence is not None:
+            evidence.stage = 'hook_mcp_thread_request'
         thread = client.call('thread/start', {'cwd': str(root), 'ephemeral': True})['thread']['id']
+        if evidence is not None:
+            evidence.stage = 'hook_mcp_turn_request'
         turn = client.call('turn/start', {'threadId': thread, 'input': [{'type': 'text', 'text': 'Owned descriptor fixture; the SessionStart hook must stop this turn.'}]})['turn']['id']
+        if evidence is not None:
+            evidence.stage = 'hook_mcp_wait_receipt'
         deadline = time.monotonic() + 20
         def completed():
             return any(frame.get('method') == 'turn/completed' and frame['params']['threadId'] == thread
                        and frame['params']['turn']['id'] == turn for frame in client.notifications)
         while not completed():
             client.observe(deadline)
+        if evidence is not None:
+            evidence.stage = 'hook_check'
         hook_runs = [frame['params']['run'] for frame in client.notifications
                      if frame.get('method') == 'hook/completed' and frame['params']['threadId'] == thread]
         if not any(run.get('status') == 'stopped' and run.get('sourcePath') == hook['sourcePath']
@@ -974,6 +1106,8 @@ def provider_fixtures(args):
         report['hook_stopped_before_model_output'] = 'PASS'
         for receipt, key, kind in ((hook_receipt, 'hook_fd_isolation', 'SessionStart'),
                                    (mcp_receipt, 'mcp_fd_isolation', 'initialize')):
+            if evidence is not None:
+                evidence.stage = 'hook_receipt' if key == 'hook_fd_isolation' else 'mcp_receipt'
             eventually(receipt.is_file, 'fixture_child_not_observed_' + key, timeout=15)
             observation = json.loads(receipt.read_text())
             owned_children.add(observation['pid'])
@@ -983,7 +1117,13 @@ def provider_fixtures(args):
             report[key] = 'PASS'
     except (ProofFailure, subprocess.TimeoutExpired) as error:
         report['diagnostic'] = str(error) if isinstance(error, ProofFailure) else 'fixture_timeout'
+        if evidence is not None:
+            report['candidate_failure'] = evidence.failure(report['diagnostic'])
     finally:
+        if evidence is not None and os.sys.exc_info()[0] is not None and 'candidate_failure' not in report:
+            # Observe an unexpected propagating exception without catching it or
+            # exposing its text. Existing exception/cleanup ordering is retained.
+            report['candidate_failure'] = evidence.failure('unclassified')
         errors = []
         for provider in providers:
             cleanup_step(errors, provider.close)
@@ -994,6 +1134,10 @@ def provider_fixtures(args):
             shutil.rmtree(root)
         else:
             report['owned_cleanup'] = 'UNVERIFIED'
+            if evidence is not None:
+                evidence.stage = 'cleanup'
+                evidence.clear_command()
+                report['candidate_cleanup_failure'] = evidence.failure(str(errors[0]))
             if 'runtime_diagnostics' not in report:
                 report['diagnostic'] = str(errors[0])
         print(json.dumps(report, sort_keys=True))
@@ -1001,6 +1145,174 @@ def provider_fixtures(args):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_candidate_cached_response_observation_is_correlated_and_has_no_io(self):
+        observer = CandidateFailureEvidence()
+        client = DirectProvider.__new__(DirectProvider)
+        frame = {'id': 'owned', 'result': {'exitCode': 1, 'stdout': '',
+                 'stderr': 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted /private/token'}}
+        client.responses = {'owned': frame, 'other': {'id': 'other', 'result': {'exitCode': 99}}}
+        observer.stage = 'pipe_wait_ready'
+        observer.activate(client, 'owned')
+        client.observe = mock.Mock(side_effect=AssertionError('additional read'))
+        client.request = mock.Mock(side_effect=AssertionError('additional request'))
+        client.response = mock.Mock(side_effect=AssertionError('additional wait'))
+        failure = observer.failure('fixture_provider_deadline')
+        self.assertEqual(failure['stage'], 'pipe_wait_ready')
+        self.assertEqual(failure['diagnostic'], 'fixture_provider_deadline')
+        self.assertEqual(failure['command']['presence'], 'observed')
+        self.assertEqual(failure['command']['validity'], 'valid')
+        self.assertEqual(failure['command']['runtime']['exit_code'], 1)
+        self.assertIn('bwrap_rtm_newaddr', failure['command']['runtime']['stderr']['signatures'])
+        self.assertNotIn('/private', json.dumps(failure))
+        self.assertIs(client.responses['owned'], frame)
+        for action in (client.observe, client.request, client.response):
+            action.assert_not_called()
+        # An unmatched cache entry, a mismatched frame ID, or no active command
+        # never borrows another request's result.
+        for frames in ({'other': frame}, {'owned': dict(frame, id='other')}, {}):
+            client.responses = frames
+            observer.activate(client, 'owned')
+            self.assertEqual(observer.failure('fixture_provider_deadline')['command']['presence'], 'not_observed')
+        observer.clear_command()
+        self.assertEqual(observer.failure('fixture_provider_deadline')['command']['presence'], 'not_observed')
+
+    def test_candidate_consumed_response_and_rpc_error_survive_without_raw_retention(self):
+        for frame, diagnostic, outcome in [
+                ({'id': 'owned', 'result': {'exitCode': 7, 'stderr': 'private secret'}},
+                 'fixture_tool_failed_null', 'response'),
+                ({'id': 'owned', 'error': {'code': -32000, 'message': 'private secret'}},
+                 'fixture_provider_request_error', 'rpc_error')]:
+            observer = CandidateFailureEvidence()
+            client = DirectProvider.__new__(DirectProvider)
+            client.responses = {'owned': frame}
+            client.candidate_evidence = observer
+            observer.activate(client, 'owned')
+            if 'error' in frame:
+                with self.assertRaisesRegex(ProofFailure, '^fixture_provider_request_error$'):
+                    client.response('owned')
+            else:
+                self.assertIs(client.response('owned'), frame['result'])
+            self.assertEqual(client.responses, {})
+            evidence = observer.failure(diagnostic)
+            self.assertEqual(evidence['command']['runtime']['outcome'], outcome)
+            self.assertNotIn('private secret', json.dumps(evidence))
+            self.assertNotIn('private secret', repr(observer.command))
+
+    def candidate_failure_fixture(self, enabled, mode='pipe', cached=True, cleanup_error=False):
+        # Real request/response/output methods, simulated received frames. There
+        # is no executable or kernel involved, and observe must fail immediately.
+        trace = []
+        class ReceivedFramesProvider(DirectProvider):
+            def __init__(self, binary, root, overrides=(), owners=None):
+                self.responses = {}
+                self.notifications = []
+                self.sequence = 0
+                self.control_identity = [9, 9, 9]
+                owners.append(self)
+
+            def send(self, frame):
+                method, params = frame['method'], frame['params']
+                trace.append(('send', method, params.get('timeoutMs'), params.get('processId')))
+                if method == 'command/exec':
+                    current = params['command'][2]
+                    if current == mode:
+                        if cached:
+                            self.responses[frame['id']] = {'id': frame['id'], 'result': {
+                                'exitCode': 1, 'stderr': 'bwrap: loopback: Failed RTM_NEWADDR private-token'}}
+                        return
+                    record = {'fds': [[0, 1, 2, 3]], 'input': 'child-only' if current == 'pipe' else ''}
+                    output = json.dumps(record)
+                    self.responses[frame['id']] = {'id': frame['id'], 'result': {'exitCode': 0, 'stdout': output}}
+                    if current != 'null':
+                        self.notifications.append({'method': 'command/exec/outputDelta', 'params': {
+                            'processId': params['processId'], 'deltaBase64': base64.b64encode(
+                                b'READY\n' + output.encode()).decode()}})
+                else:
+                    self.responses[frame['id']] = {'id': frame['id'], 'result': {}}
+
+            def output(self, process_id):
+                trace.append(('output', process_id))
+                return super().output(process_id)
+
+            def response(self, request_id, timeout=30):
+                trace.append(('response', request_id, timeout))
+                return super().response(request_id, timeout)
+
+            def observe(self, deadline):
+                trace.append(('observe',))
+                raise ProofFailure('fixture_provider_deadline')
+
+            def close(self):
+                trace.append(('close',))
+                if cleanup_error:
+                    raise ProofFailure('fixture_owned_tree_cleanup')
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / ('herdr-codex-' + 'e' * 32)
+            args = argparse.Namespace(session='codex-proof-' + 'e' * 32, scratch=root,
+                                      provider_path=Path('/unused'), require_linux_enforcement=enabled)
+            with mock.patch(__name__ + '.validate_provider', return_value='/unused'), mock.patch(
+                    __name__ + '.process_parents', return_value={}), mock.patch(
+                    __name__ + '.DirectProvider', ReceivedFramesProvider), redirect_stdout(io.StringIO()) as output:
+                status = provider_fixtures(args)
+            return status, json.loads(output.getvalue()), trace
+
+    def test_candidate_failure_instrumentation_preserves_interactions_and_default_report(self):
+        for mode in ('null', 'pipe', 'pty'):
+            for cleanup_error in (False, True):
+                plain_status, plain, plain_trace = self.candidate_failure_fixture(False, mode, cleanup_error=cleanup_error)
+                status, report, trace = self.candidate_failure_fixture(True, mode, cleanup_error=cleanup_error)
+                self.assertEqual(status, plain_status)
+                self.assertEqual(status, 1)
+                self.assertEqual(trace, plain_trace)
+                self.assertEqual({key: value for key, value in report.items() if not key.startswith('candidate_')}, plain)
+                failure = report['candidate_failure']
+                self.assertEqual(failure['stage'], mode + ('_response' if mode == 'null' else '_wait_ready'))
+                self.assertEqual(failure['diagnostic'], 'fixture_tool_failed_null' if mode == 'null' else 'fixture_provider_deadline')
+                self.assertEqual(failure['command']['runtime']['exit_code'], 1)
+                self.assertEqual(failure['tool_modes'], {'null': mode != 'null', 'pipe': mode == 'pty', 'pty': False})
+                self.assertEqual(report['tool_fd_isolation'], 'UNVERIFIED')
+                self.assertEqual(report['owned_cleanup'], 'UNVERIFIED' if cleanup_error else 'PASS')
+                if cleanup_error:
+                    self.assertEqual(report['candidate_cleanup_failure']['stage'], 'cleanup')
+                    self.assertEqual(report['candidate_cleanup_failure']['diagnostic'], 'fixture_owned_tree_cleanup')
+                    self.assertEqual(report['candidate_cleanup_failure']['command']['presence'], 'not_observed')
+                else:
+                    self.assertNotIn('candidate_cleanup_failure', report)
+                self.assertNotIn('private-token', json.dumps(report))
+        _, report, trace = self.candidate_failure_fixture(True, cached=False)
+        self.assertEqual(report['candidate_failure']['command']['presence'], 'not_observed')
+        self.assertEqual(report['candidate_failure']['command']['runtime']['outcome'], 'not_observed')
+        self.assertEqual(trace, self.candidate_failure_fixture(False, cached=False)[2])
+
+    def test_candidate_response_malformed_and_unmatched_evidence_is_bounded(self):
+        observer = CandidateFailureEvidence()
+        client = DirectProvider.__new__(DirectProvider)
+        client.responses = {}
+        for result in (None, [], {'exitCode': True}, {'exitCode': 2 ** 31},
+                       {'exitCode': 0, 'stdout': {'private': 'secret'}}, {'exitCode': 0, 'stderr': ['private']}):
+            observer.activate(client, 'owned')
+            observer.received(client, 'owned', {'id': 'owned', 'result': result})
+            observed = observer.failure('private-token')['command']
+            self.assertEqual(observed['presence'], 'observed')
+            self.assertEqual(observed['validity'], 'malformed')
+            self.assertEqual(observed['runtime']['outcome'], 'malformed_result')
+            self.assertNotIn('private', json.dumps(observed))
+        observer.activate(client, 'owned')
+        for owner, request, frame in [(object(), 'owned', {'id': 'owned'}),
+                (client, 'other', {'id': 'owned'}), (client, 'owned', {'id': 'other'}),
+                (client, 'owned', {'id': 'owned', 'method': 'private'}), (client, 'owned', [])]:
+            observer.received(owner, request, frame)
+            self.assertEqual(observer.command['presence'], 'not_observed')
+        # The bounded existing runtime shape is reused even for oversized output.
+        observer.received(client, 'owned', {'id': 'owned', 'result': {
+            'exitCode': -(2 ** 31), 'stdout': 'é' * 2100000 + 'private-token'}})
+        failure = observer.failure('private-token')
+        self.assertEqual(failure['diagnostic'], 'unclassified')
+        self.assertEqual(failure['command']['runtime']['stdout']['observed_utf8_bytes'], 4194305)
+        self.assertEqual(failure['command']['runtime']['stdout']['scan_utf8_bytes'], 65536)
+        self.assertLess(len(json.dumps(failure)), 4096)
+
     def test_enforcement_requires_exact_true_boolean_evidence(self):
         good = {key: True for key in ENFORCEMENT_KEYS}
         result = {'exitCode': 0, 'stdout': json.dumps(good), 'stderr': ''}

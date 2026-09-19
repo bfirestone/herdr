@@ -318,6 +318,42 @@ remain mandatory. A missing, false or malformed enforcement field fails the
 candidate. JSON diagnostics contain fixed categories/scalars, never raw provider
 output, profile labels, PIDs, command arguments or arbitrary paths/environment.
 
+The source3 experiment at `ec517bc0dcfcd34623aa82750e7d142f8ebf83d0`
+(run `35422893035`, Linux attempt 2) passed preflight, confirmed the two owned
+profile hashes and add epoch increment of two, and restored profiles, paths,
+restrictions and provider bytes during cleanup. Its preflight classified 123
+profiles as opaque-only. Both native and npm candidate fixtures failed with an
+unclassified diagnostic and successful owned reap; the second no-drift preview
+was skipped. This establishes setup and cleanup evidence, **not child selection,
+enforcement, FD proof, or qualification**. The first Linux attempt stopped in
+the unrelated federated reconnect test before the experiment; its failure is
+retained separately and its cause remains unresolved.
+
+Source4 adds failure observation only under `--require-linux-enforcement`.
+`candidate_failure` reports a fixed current boundary (initialization; null,
+pipe or PTY request/READY/write/response/descriptor checks; enforcement;
+hook/MCP setup/requests/receipts; or cleanup) and per-mode booleans that become
+true only after that mode's existing descriptor and input assertions pass.
+A separate `candidate_cleanup_failure` preserves cleanup failure without losing
+the original candidate failure, even where the existing top-level diagnostic
+reports cleanup. These fields do not qualify the whole fixture.
+
+The observer projects only the current owned command's already-received response:
+a matching response consumed by the existing response method, or its matching
+cached entry at failure. Client, active request and frame identity must match;
+no request IDs are emitted. Presence, structural validity, bounded exit code,
+output types/byte counts and the existing fixed runtime signatures are retained;
+raw output/error text is not. An absent response is `not_observed`. A cached
+terminal result during READY waiting may therefore accompany the original
+deadline, without consuming that result or changing the wait. No new provider
+request, read, retry, wait, timeout, policy or transport behavior is introduced.
+The public wrapper also retains the literal initialization, account, provider,
+bounds, input/isolation, enforcement, hook/MCP and cleanup failure categories;
+unknown strings and invalid fields receive fixed fallbacks. Normal fixture
+interaction and report behavior remains unchanged without the candidate flag.
+Actual failure phase and cause remain unknown until the new exact-commit run;
+these local observations do not identify an AppArmor or PTY defect.
+
 The final workflow step always attempts exact owned rollback after an attempted
 apply. Before any candidate provider starts, a fresh fixed runner-owned status
 record is created; it records each launcher's successful observed reap. An

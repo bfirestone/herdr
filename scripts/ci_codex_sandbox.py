@@ -609,13 +609,53 @@ def safe_fixture_report(report):
                 'owned_cleanup', 'provider_authentication', 'hook_stopped_before_model_output'):
         if key in report:
             result[key] = report[key] if isinstance(report[key], str) and report[key] in statuses else 'UNVERIFIED'
-    result['failure_observed'] = 'diagnostic' in report
-    diagnostics = {'fixture_enforcement_malformed', 'fixture_enforcement_not_proven',
-                   'fixture_candidate_environment', 'fixture_candidate_not_first', 'fixture_candidate_ineligible',
-                   'fixture_denial_target_invalid', 'fixture_parent_write_control', 'fixture_parent_network_control',
-                   'fixture_outside_canary_changed', 'fixture_listener_reached', 'fixture_tool_failed_null',
-                   'fixture_tool_failed_pipe', 'fixture_tool_failed_pty', 'fixture_timeout',
-                   'fixture_owned_tree_cleanup', 'process_inspection_unavailable'}
+    result['failure_observed'] = any(key in report for key in ('diagnostic', 'candidate_failure', 'candidate_cleanup_failure'))
+    try:
+        from test_integrated_codex import CANDIDATE_FAILURE_STAGES, FIXTURE_DIAGNOSTICS, RUNTIME_SIGNATURES
+    except ModuleNotFoundError:
+        from scripts.test_integrated_codex import CANDIDATE_FAILURE_STAGES, FIXTURE_DIAGNOSTICS, RUNTIME_SIGNATURES
+    diagnostics = FIXTURE_DIAGNOSTICS
+    labels = {name for name, _ in RUNTIME_SIGNATURES}
+    outcomes = {'not_run', 'not_observed', 'response', 'malformed_result', 'transport_error', 'rpc_error',
+                'deadline', 'bound', 'provider_exit', 'ownership_unverified'}
+
+    def runtime(item):
+        item = item if isinstance(item, dict) else {}
+        code = item.get('exit_code')
+        observed = {'exit_code': code if type(code) is int and -(2 ** 31) <= code < 2 ** 31 else None,
+                    'outcome': enum(item.get('outcome'), outcomes, 'malformed_result')}
+        for stream in ('stdout', 'stderr'):
+            data = item.get(stream, {})
+            data = data if isinstance(data, dict) else {}
+            signatures = data.get('signatures', [])
+            observed[stream] = {
+                'type': enum(data.get('type'), ('absent', 'string', 'other'), 'other'),
+                'signatures': sorted(labels.intersection(v for v in signatures if isinstance(v, str)))
+                              if isinstance(signatures, list) and len(signatures) <= len(labels) else [],
+                'scan_truncated': data.get('scan_truncated') is True,
+                'unmatched_nonempty': data.get('unmatched_nonempty') is True,
+            }
+            for key, bound in (('observed_utf8_bytes', 4194305), ('scan_utf8_bytes', 65536)):
+                value = data.get(key)
+                observed[stream][key] = value if type(value) is int and 0 <= value <= bound else None
+        return observed
+
+    for key in ('candidate_failure', 'candidate_cleanup_failure'):
+        if key not in report:
+            continue
+        detail = report[key] if isinstance(report[key], dict) else {}
+        modes = detail.get('tool_modes')
+        modes = modes if isinstance(modes, dict) else {}
+        command = detail.get('command')
+        command = command if isinstance(command, dict) else {}
+        result[key] = {
+            'stage': enum(detail.get('stage'), CANDIDATE_FAILURE_STAGES, 'unknown'),
+            'diagnostic': enum(detail.get('diagnostic'), diagnostics, 'unclassified'),
+            'tool_modes': {mode: modes.get(mode) is True for mode in ('null', 'pipe', 'pty')},
+            'command': {'presence': enum(command.get('presence'), ('observed', 'not_observed'), 'not_observed'),
+                        'validity': enum(command.get('validity'), ('valid', 'malformed', 'unknown'), 'unknown'),
+                        'runtime': runtime(command.get('runtime'))},
+        }
     if 'diagnostic' in report:
         result['diagnostic'] = enum(report['diagnostic'], diagnostics, 'unclassified')
     enforcement = report.get('linux_enforcement')
@@ -626,35 +666,9 @@ def safe_fixture_report(report):
         result['linux_enforcement'] = {key: enforcement.get(key) is True for key in keys}
     detail = report.get('runtime_diagnostics')
     if isinstance(detail, dict):
-        # Use the exact existing diagnostic category list, but never its literals.
-        try:
-            from test_integrated_codex import RUNTIME_SIGNATURES
-        except ModuleNotFoundError:
-            from scripts.test_integrated_codex import RUNTIME_SIGNATURES
-        labels = {name for name, _ in RUNTIME_SIGNATURES}
-        outcomes = {'not_run', 'response', 'malformed_result', 'transport_error', 'rpc_error',
-                    'deadline', 'bound', 'provider_exit', 'ownership_unverified'}
         clean = {'python_started': detail.get('python_started') is True}
         for name in ('original_control', 'true', 'python_startup'):
-            item = detail.get(name, {})
-            item = item if isinstance(item, dict) else {}
-            code = item.get('exit_code')
-            observed = {'exit_code': code if type(code) is int and -(2 ** 31) <= code < 2 ** 31 else None,
-                        'outcome': enum(item.get('outcome'), outcomes, 'malformed_result')}
-            for stream in ('stdout', 'stderr'):
-                data = item.get(stream, {})
-                data = data if isinstance(data, dict) else {}
-                signatures = data.get('signatures', [])
-                observed[stream] = {
-                    'type': enum(data.get('type'), ('absent', 'string', 'other'), 'other'),
-                    'signatures': sorted(labels.intersection(v for v in signatures if isinstance(v, str))) if isinstance(signatures, list) else [],
-                    'scan_truncated': data.get('scan_truncated') is True,
-                    'unmatched_nonempty': data.get('unmatched_nonempty') is True,
-                }
-                for key, bound in (('observed_utf8_bytes', 4194305), ('scan_utf8_bytes', 65536)):
-                    value = data.get(key)
-                    observed[stream][key] = value if type(value) is int and 0 <= value <= bound else None
-            clean[name] = observed
+            clean[name] = runtime(detail.get(name))
         result['runtime_diagnostics'] = clean
     environment = report.get('runtime_environment')
     if isinstance(environment, dict):

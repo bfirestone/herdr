@@ -427,6 +427,55 @@ class SandboxTests(unittest.TestCase):
                 with self.assertRaisesRegex(sandbox.Refused, 'provider_package_mismatch'):
                     sandbox.resource()
 
+    def test_candidate_failure_projection_retains_fixed_stages_and_categories(self):
+        from scripts.test_integrated_codex import CANDIDATE_FAILURE_STAGES, FIXTURE_DIAGNOSTICS
+        for stage in CANDIDATE_FAILURE_STAGES:
+            for diagnostic in FIXTURE_DIAGNOSTICS:
+                report = sandbox.safe_fixture_report({'diagnostic': diagnostic, 'candidate_failure': {
+                    'stage': stage, 'diagnostic': diagnostic, 'tool_modes': {'null': True, 'pipe': False, 'pty': False}}})
+                self.assertEqual(report['diagnostic'], diagnostic)
+                self.assertEqual(report['candidate_failure']['stage'], stage)
+                self.assertEqual(report['candidate_failure']['diagnostic'], diagnostic)
+                self.assertEqual(report['candidate_failure']['tool_modes'], {'null': True, 'pipe': False, 'pty': False})
+
+    def test_candidate_projection_rejects_private_malformed_and_oversized_fields(self):
+        from scripts.test_integrated_codex import RUNTIME_SIGNATURES
+        private = '/private/token'
+        for value in (private, [], {}, 2 ** 64, None):
+            raw = {'stage': value, 'diagnostic': value, 'tool_modes': {'null': value},
+                   'command': {'presence': value, 'validity': value, 'runtime': {
+                       'exit_code': value, 'outcome': value, 'stdout': {
+                           'type': value, 'observed_utf8_bytes': value, 'scan_utf8_bytes': value,
+                           'scan_truncated': value, 'unmatched_nonempty': value,
+                           'signatures': [private] * (len(RUNTIME_SIGNATURES) + 1)}}}, 'secret': private}
+            safe = sandbox.safe_fixture_report({'candidate_failure': raw, 'candidate_cleanup_failure': raw})
+            self.assertTrue(safe['failure_observed'])
+            for key in ('candidate_failure', 'candidate_cleanup_failure'):
+                item = safe[key]
+                self.assertEqual(item['stage'], 'unknown')
+                self.assertEqual(item['diagnostic'], 'unclassified')
+                self.assertEqual(item['tool_modes'], {'null': False, 'pipe': False, 'pty': False})
+                self.assertEqual(item['command']['presence'], 'not_observed')
+                self.assertEqual(item['command']['validity'], 'unknown')
+                runtime = item['command']['runtime']
+                self.assertIsNone(runtime['exit_code'])
+                self.assertEqual(runtime['outcome'], 'malformed_result')
+                self.assertIsNone(runtime['stdout']['observed_utf8_bytes'])
+                self.assertIsNone(runtime['stdout']['scan_utf8_bytes'])
+                self.assertEqual(runtime['stdout']['signatures'], [])
+            self.assertNotIn(private, json.dumps(safe))
+            self.assertLess(len(json.dumps(safe)), 4096)
+        # All existing fixed signatures survive in their existing bounded shape.
+        labels = [label for label, _ in RUNTIME_SIGNATURES]
+        raw = {'command': {'runtime': {'exit_code': -(2 ** 31), 'outcome': 'response',
+               'stderr': {'type': 'string', 'signatures': labels, 'observed_utf8_bytes': 4194305,
+                          'scan_utf8_bytes': 65536, 'scan_truncated': True, 'unmatched_nonempty': False}}}}
+        result = sandbox.safe_fixture_report({'candidate_failure': raw})['candidate_failure']['command']['runtime']
+        self.assertEqual(result['exit_code'], -(2 ** 31))
+        self.assertEqual(result['stderr']['signatures'], sorted(labels))
+        self.assertEqual(result['stderr']['observed_utf8_bytes'], 4194305)
+        self.assertEqual(result['stderr']['scan_utf8_bytes'], 65536)
+
     def test_public_report_discards_arbitrary_strings_paths_pids_and_keys(self):
         report = {'secret': '/private/secret', 'diagnostic': 'token secret', 'owned_cleanup': 'PASS',
                   'tool_fd_isolation': {'secret': True}, 'linux_enforcement': {'stacked_enforce': 'secret', 'pid': 123},
