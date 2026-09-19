@@ -5,7 +5,12 @@ use std::process::Command;
 #[test]
 fn codex_qualification_harness_has_offline_safety_contracts() {
     let output = Command::new("python3")
-        .args(["-m", "unittest", "scripts.test_integrated_codex"])
+        .args([
+            "-m",
+            "unittest",
+            "scripts.test_integrated_codex",
+            "scripts.test_ci_codex_sandbox",
+        ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("python3 is required for integrated provider fixtures");
@@ -45,7 +50,7 @@ fn codex_ci_covers_both_bootstrap_platforms_without_live_authentication() {
     ))
     .expect("a dedicated integrated-agent fixture workflow is required");
     for required in [
-        "ubuntu-latest",
+        "ubuntu-24.04",
         "macos-latest",
         "1.98.1",
         "--provider-fixtures-only",

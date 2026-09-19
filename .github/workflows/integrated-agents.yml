@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
@@ -60,7 +60,29 @@ jobs:
           just docs-contract-test
       - name: Install exact provider only in disposable runner tools
         run: npm install --prefix "$RUNNER_TEMP/herdr-codex-provider" --ignore-scripts --no-audit --no-fund @openai/codex@0.154.0
+      - name: Linux original baseline (separate experiment control)
+        if: runner.os == 'Linux' && github.repository == 'bfirestone/herdr' && github.ref == 'refs/heads/feat/desktop-exact-delivery'
+        run: python3 scripts/ci_codex_sandbox.py baseline
+      - name: Preview exact disposable Linux runtime and rollback
+        if: runner.os == 'Linux' && github.repository == 'bfirestone/herdr' && github.ref == 'refs/heads/feat/desktop-exact-delivery'
+        run: sudo --preserve-env=CI,GITHUB_ACTIONS,GITHUB_REPOSITORY,GITHUB_REF,RUNNER_TEMP /usr/bin/python3 scripts/ci_codex_sandbox.py plan
+      - name: Apply exact owned Linux runtime
+        id: linux_runtime
+        if: runner.os == 'Linux' && github.repository == 'bfirestone/herdr' && github.ref == 'refs/heads/feat/desktop-exact-delivery'
+        run: sudo --preserve-env=CI,GITHUB_ACTIONS,GITHUB_REPOSITORY,GITHUB_REF,RUNNER_TEMP /usr/bin/python3 scripts/ci_codex_sandbox.py apply
+      - name: Nonroot Linux candidate descriptor and enforcement fixtures
+        if: runner.os == 'Linux' && steps.linux_runtime.outcome == 'success'
+        run: python3 scripts/ci_codex_sandbox.py candidate
+      - name: Verify Linux runtime and repeat preview without drift
+        if: runner.os == 'Linux' && steps.linux_runtime.outcome == 'success'
+        run: |
+          sudo --preserve-env=CI,GITHUB_ACTIONS,GITHUB_REPOSITORY,GITHUB_REF,RUNNER_TEMP /usr/bin/python3 scripts/ci_codex_sandbox.py verify
+          sudo --preserve-env=CI,GITHUB_ACTIONS,GITHUB_REPOSITORY,GITHUB_REF,RUNNER_TEMP /usr/bin/python3 scripts/ci_codex_sandbox.py plan
+      - name: Always restore only the owned Linux runtime
+        if: always() && runner.os == 'Linux' && steps.linux_runtime.outcome != 'skipped' && steps.linux_runtime.outcome != ''
+        run: sudo --preserve-env=CI,GITHUB_ACTIONS,GITHUB_REPOSITORY,GITHUB_REF,RUNNER_TEMP /usr/bin/python3 scripts/ci_codex_sandbox.py cleanup
       - name: Shipped native and npm launcher descriptor fixtures without model sampling
+        if: runner.os != 'Linux' || github.repository != 'bfirestone/herdr' || github.ref != 'refs/heads/feat/desktop-exact-delivery'
         # These fixtures use a stop-only owned SessionStart hook. Live text and
         # permission qualification is a separate opt-in local command, never CI.
         run: |

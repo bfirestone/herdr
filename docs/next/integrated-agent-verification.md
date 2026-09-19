@@ -196,3 +196,107 @@ used a process-only `commit.gpgsign=false` override; saved Git settings were
 unchanged. An earlier restricted-host run failed process-observation and host-key
 fixtures; the complete run with normal host access passed. No unrelated failure
 was silently waived. The workflow still needs actual macOS/Linux run evidence.
+
+## Bounded Ubuntu runtime experiment (not qualification)
+
+The diagnostic baseline at `e6744b00428fe51be83b886317e794afc29f4984`,
+[run 35417557753](https://github.com/bfirestone/herdr/actions/runs/35417557753),
+passed the Rust gates on both platforms and native/npm descriptor fixtures on
+macOS. All six Ubuntu original/supplemental commands failed before Python at
+bubblewrap's loopback `RTM_NEWADDR` setup with `EPERM`; both launchers reaped
+successfully. This identifies the failed operation, **not the selected executable
+or specific denying LSM rule**. AppArmor was enabled and its unprivileged-userns
+restriction was 1. Baseline LSM attribution remains unknown; no audit policy or
+logging service is changed to manufacture evidence.
+
+A separate, unqualified CI experiment targets only the disposable Ubuntu 24.04
+x86_64 job on `bfirestone/herdr`, branch `feat/desktop-exact-delivery`.
+`scripts/ci_codex_sandbox.py` has explicit `plan`, `apply`, `verify`, `cleanup`,
+`baseline`, and `candidate` modes. It refuses other OS/repository/ref/user targets.
+The Linux baseline runs one fresh fixture per launcher with the existing two
+supplemental diagnostic requests after null-control failure. Its exit and fixed
+observations are recorded separately; an expected baseline failure is never
+candidate success. macOS retains its original fixture path.
+
+The candidate copies the already installed pinned package's exact bwrap bytes to
+`/opt/herdr-codex-runtime/0.154.0/bwrap`. The expected resource size is 529,776
+bytes and SHA-256 is
+`01fb705f067bd5365b63d8ad2323a61c8d007733ca5e649437e086f3fb9935d8`.
+This value was independently derived from the npm platform tarball after checking
+registry SHA-512 integrity
+`sha512-a4FI3A8sGtwGrOqltrPbrS2hajrHQG591EwmRfiRoLMb10VxdBtUGW4gu6IJVYENiYGA7k3P4jlRHEoCZU/s9Q==`.
+That establishes registry-integrity provenance, not an independently verified
+signing attestation. The installed package identity and original resource hash
+are checked again at each setup/verification/cleanup boundary.
+
+APT downloads only `apparmor-profiles=4.0.1really4.0.1-0ubuntu0.24.04.7`
+using authenticated archive metadata. `dpkg-deb` reads its data archive; no package
+installation or maintainer script runs. Only the shipped ABI-4
+`bwrap-userns-restrict` member is read. Its SHA-256 must be
+`11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9`.
+The sole byte substitution changes its executable attachment from `/usr/bin/bwrap`
+to the fixed staged path. All permission rules, lowercase `px`/`pix` transitions,
+child stacking and `audit deny capability` stay intact. Lowercase `px` does not
+by itself establish environment sanitization. The distro bubblewrap package is
+neither installed nor substituted.
+
+Preflight checks existing ABI/include support, scalar restrictions, root-owned
+nonwritable parent chains, absent owned files/profiles, and absent optional local
+profile customizations. It inventories loaded attachment expressions and proves
+non-overlap using literal prefixes and bounded finite brace alternatives;
+ambiguous expressions fail closed. Kernel `attach` output of `<unknown>` is
+ambiguous, while an unattached profile reports its plain name. See the
+[Linux AppArmor filesystem implementation](https://github.com/torvalds/linux/blob/v6.8/security/apparmor/apparmorfs.c#L1025).
+The root-owned private journal is registered before runtime/policy mutation.
+Only a no-load parse and add of the two absent profiles are supported, never
+replacement or a service reload. Optional missing restriction scalars remain
+unknown; existing values are compared unchanged, never written.
+
+The candidate prepends the staged directory only to the fixture subprocess PATH.
+The provider and all proof children remain the original nonroot runner user.
+`--require-linux-enforcement` is accepted only for this Linux CI fixture target,
+and cannot be combined with runtime diagnostics or live model/consent smoke.
+One additional nonstreaming `command/exec` per launcher uses the unchanged cwd
+and default policy, `timeoutMs=10000`, and the existing 30-second response budget.
+There are no retries. Added controls have a 10-second help bound, at most three
+one-second parent socket operations, a half-second child connection attempt,
+and a 0.1-second listener check; the child attempt is inside the command budget.
+Thus the added per-launcher proof is bounded by 43.1 seconds of explicit waits
+plus local operations, within the unchanged 45-minute workflow limit. Existing
+provider/descriptor/hook/MCP request and reap limits remain intact; the wrapper
+does not kill the harness on a separate timeout that could strand its children.
+
+Strict fixed booleans must prove Python startup, exact
+`bwrap//&unpriv_bwrap (enforce)` child label, nonroot execution, zero effective and
+permitted capabilities, no-new-privileges and seccomp filtering. PATH eligibility
+alone is insufficient. The same child must fail to overwrite one fresh owned
+canary outside cwd and `/tmp` writable roots and fail to connect to an owned
+parent loopback listener. Parent write/read and connection controls must succeed,
+the canary must remain unchanged, and the listener must receive no child
+connection. No user's existing file or external network endpoint is touched.
+The original null/private-pipe/PTY, hook, MCP, no-account and cleanup assertions
+remain mandatory. A missing, false or malformed enforcement field fails the
+candidate. JSON diagnostics contain fixed categories/scalars, never raw provider
+output, profile labels, PIDs, command arguments or arbitrary paths/environment.
+
+The final workflow step always attempts exact owned rollback after an attempted
+apply. Before any candidate provider starts, a fresh fixed runner-owned status
+record is created; it records each launcher's successful observed reap. An
+incomplete/malformed status prevents root cleanup from removing policy underneath
+an uncertain provider tree. Root cleanup only unloads the profiles observed added
+by this invocation, verifies file identity/hash/ownership, removes matching owned
+files and newly created parents, preserves preexisting parents, and checks original
+restrictions/provider bytes/profile inventory and path absence. Interrupted or
+tampered state is retained and fails the job; runner disposal is extra containment,
+not evidence of verified cleanup. Before publication the candidate commit can be
+reverted; the published diagnostic base remains the configuration rollback.
+
+Offline tests simulate Linux kernel/package-manager boundaries and exercise
+collision, tamper, partial-add rollback, unknown ownership, redaction, child
+observations and denial controls. They run through the existing Rust integration
+gate. They are **not host-kernel or live CI enforcement evidence**. This candidate
+still needs one independently reviewed, published exact-commit branch run showing
+separate baseline/candidate results, both complete fixture passes, unchanged
+restrictions, second preview with no drift and restored cleanup. No Linux
+qualification, Desktop M2/T3 closure, or exact Send activation follows from these
+local tests or the workflow definition.

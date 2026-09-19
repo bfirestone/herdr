@@ -24,6 +24,7 @@ import tempfile
 import time
 import unittest
 import io
+import socket
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -775,6 +776,104 @@ def runtime_environment_metadata():
             'bwrap_profile_file_present': profile_present}
 
 
+# This request runs only in the reviewed Linux CI candidate, under the same
+# command/exec default policy/cwd as the descriptor requests. Never emit paths,
+# labels, capability values, errors or socket endpoints from the child.
+ENFORCEMENT_KEYS = frozenset(('stacked_enforce', 'effective_caps_zero', 'permitted_caps_zero',
+                              'no_new_privs', 'seccomp_filter', 'python_started', 'nonroot',
+                              'outside_write_denied', 'loopback_connect_denied'))
+ENFORCEMENT_CHILD = r'''
+import errno,json,os,socket,sys
+from pathlib import Path
+status=dict(line.split(':',1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
+result={
+ 'stacked_enforce':Path('/proc/self/attr/current').read_text().strip('\n\0')=='bwrap//&unpriv_bwrap (enforce)',
+ 'effective_caps_zero':status.get('CapEff','').strip()=='0000000000000000',
+ 'permitted_caps_zero':status.get('CapPrm','').strip()=='0000000000000000',
+ 'no_new_privs':status.get('NoNewPrivs','').strip()=='1',
+ 'seccomp_filter':status.get('Seccomp','').strip()=='2',
+ 'python_started':True,'nonroot':os.getuid()!=0,
+ 'outside_write_denied':False,'loopback_connect_denied':False,
+}
+try:
+ with open(sys.argv[1],'wb') as handle: handle.write(b'changed')
+except OSError as error:
+ result['outside_write_denied']=error.errno in (errno.EACCES,errno.EPERM,errno.EROFS)
+try:
+ with socket.create_connection(('127.0.0.1',int(sys.argv[2])),timeout=0.5): pass
+except OSError as error:
+ result['loopback_connect_denied']=isinstance(error,TimeoutError) or error.errno in (errno.EACCES,errno.EPERM,errno.ECONNREFUSED,errno.ENETUNREACH,errno.EHOSTUNREACH,errno.ETIMEDOUT)
+print(json.dumps(result,sort_keys=True),flush=True)
+'''
+
+
+def enforcement_observation(result):
+    if (runtime_exit_code(result) != 0 or not isinstance(result.get('stdout'), str) or
+            len(result['stdout']) > 1024 or result.get('stderr', '') != ''):
+        raise ProofFailure('fixture_enforcement_malformed')
+    try:
+        value = json.loads(result['stdout'])
+    except (ValueError, TypeError):
+        raise ProofFailure('fixture_enforcement_malformed') from None
+    if not isinstance(value, dict) or set(value) != ENFORCEMENT_KEYS or any(type(v) is not bool for v in value.values()):
+        raise ProofFailure('fixture_enforcement_malformed')
+    if not all(value.values()):
+        raise ProofFailure('fixture_enforcement_not_proven')
+    return value
+
+
+def linux_enforcement(client, root, python):
+    # HOME is intentionally preserved by descriptor_environment. Use a NEW
+    # private child of that directory, outside cwd and the /tmp writable roots.
+    try:
+        from ci_codex_sandbox import BWRAP, RESOURCE_HASH, RUNTIME, Refused, chain, digest, identity, target
+    except ModuleNotFoundError:
+        from scripts.ci_codex_sandbox import BWRAP, RESOURCE_HASH, RUNTIME, Refused, chain, digest, identity, target
+    try:
+        target()
+        chain(RUNTIME)
+        identity(BWRAP, mode=0o755)
+    except (Refused, OSError):
+        raise ProofFailure('fixture_candidate_environment') from None
+    if shutil.which('bwrap') != str(BWRAP) or digest(BWRAP.read_bytes()) != RESOURCE_HASH:
+        raise ProofFailure('fixture_candidate_not_first')
+    help_result = subprocess.run([str(BWRAP), '--help'], capture_output=True, timeout=10)
+    if help_result.returncode or not all(flag in help_result.stdout for flag in (b'--as-pid-1', b'--perms', b'--argv0', b'--ro-bind-fd')):
+        raise ProofFailure('fixture_candidate_ineligible')
+    with tempfile.TemporaryDirectory(prefix='herdr-codex-denial-', dir=Path.home()) as temporary, socket.socket() as listener:
+        canary = Path(temporary) / 'canary'
+        if root == canary.parent or root in canary.parents or Path('/tmp') in canary.parents:
+            raise ProofFailure('fixture_denial_target_invalid')
+        canary.write_bytes(b'parent-control')
+        if canary.read_bytes() != b'parent-control':
+            raise ProofFailure('fixture_parent_write_control')
+        canary.write_bytes(b'owned-before')
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(2)
+        listener.settimeout(1)
+        with socket.create_connection(listener.getsockname(), timeout=1) as control:
+            connection, _ = listener.accept()
+            with connection:
+                connection.sendall(b'ok')
+            if control.recv(2) != b'ok':
+                raise ProofFailure('fixture_parent_network_control')
+        request = client.request('command/exec', {'command': [python, '-c', ENFORCEMENT_CHILD,
+                                 str(canary), str(listener.getsockname()[1])], 'cwd': str(root), 'timeoutMs': 10000})
+        observation = enforcement_observation(client.response(request, timeout=30))
+        if canary.read_bytes() != b'owned-before':
+            raise ProofFailure('fixture_outside_canary_changed')
+        listener.settimeout(0.1)
+        try:
+            connection, _ = listener.accept()
+        except TimeoutError:
+            pass
+        else:
+            connection.close()
+            raise ProofFailure('fixture_listener_reached')
+        return dict(observation, parent_write_control=True, parent_connect_control=True,
+                    canary_unchanged=True, parent_listener_unreached=True)
+
+
 def provider_fixtures(args):
     validate_targets(args.session, args.scratch)
     process_parents()
@@ -822,6 +921,8 @@ def provider_fixtures(args):
             assert_isolated(observation, client.control_identity)
             if observation['input'] != ('child-only' if mode == 'pipe' else 'pty-ok' if mode == 'pty' else ''):
                 raise ProofFailure('fixture_tool_input_mismatch')
+        if getattr(args, 'require_linux_enforcement', False):
+            report['linux_enforcement'] = linux_enforcement(client, root, python)
         report['provider_authentication'] = 'PASS_no_account_empty_home'
         report['tool_fd_isolation'] = 'PASS_null_private_pipe_and_pty'
         client.close()
@@ -900,6 +1001,116 @@ def provider_fixtures(args):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_enforcement_requires_exact_true_boolean_evidence(self):
+        good = {key: True for key in ENFORCEMENT_KEYS}
+        result = {'exitCode': 0, 'stdout': json.dumps(good), 'stderr': ''}
+        self.assertEqual(enforcement_observation(result), good)
+        for key in good:
+            for value in (False, 1, None, 'true'):
+                with self.subTest(key=key, value=value), self.assertRaises(ProofFailure):
+                    enforcement_observation(dict(result, stdout=json.dumps(dict(good, **{key: value}))))
+            missing = dict(good)
+            del missing[key]
+            with self.assertRaises(ProofFailure):
+                enforcement_observation(dict(result, stdout=json.dumps(missing)))
+        for bad in ({'exitCode': 1}, dict(result, stderr='private diagnostic'),
+                    dict(result, stdout='[]'), dict(result, stdout='secret' * 500),
+                    dict(result, stdout=json.dumps(dict(good, extra=True)))):
+            with self.assertRaises(ProofFailure):
+                enforcement_observation(bad)
+
+    def test_enforcement_child_observes_kernel_fields_and_only_owned_denials(self):
+        import errno
+        original = {'CapEff': '0000000000000000', 'CapPrm': '0000000000000000', 'NoNewPrivs': '1', 'Seccomp': '2'}
+        scenarios = [(None, None, None), ('CapEff', '0000000000000001', 'effective_caps_zero'),
+                     ('CapPrm', '0000000000000001', 'permitted_caps_zero'),
+                     ('NoNewPrivs', '0', 'no_new_privs'), ('Seccomp', '0', 'seccomp_filter'),
+                     ('label', 'unconfined', 'stacked_enforce'),
+                     ('label', 'bwrap//&unpriv_bwrap (complain)', 'stacked_enforce'),
+                     ('label', 'prefix-bwrap//&unpriv_bwrap (enforce)', 'stacked_enforce')]
+        for key, value, expected_false in scenarios:
+            status = dict(original)
+            if key in status:
+                status[key] = value
+            label = value if key == 'label' else 'bwrap//&unpriv_bwrap (enforce)'
+            def read(path, *args, **kwargs):
+                return label + '\n' if str(path).endswith('/attr/current') else '\n'.join(k + ':\t' + v for k, v in status.items())
+            with self.subTest(key=key, value=value), mock.patch.object(Path, 'read_text', read), mock.patch.object(
+                    os, 'getuid', return_value=1001), mock.patch('sys.argv', ['probe', '/owned/canary', '12345']), mock.patch(
+                    'builtins.open', side_effect=PermissionError(errno.EACCES, 'private-path')) as opened, mock.patch.object(
+                    socket, 'create_connection', side_effect=ConnectionRefusedError(errno.ECONNREFUSED, 'private-endpoint')) as connected, redirect_stdout(io.StringIO()) as output:
+                exec(ENFORCEMENT_CHILD, {})
+            observation = json.loads(output.getvalue())
+            self.assertEqual(set(observation), ENFORCEMENT_KEYS)
+            self.assertNotIn('private', output.getvalue())
+            opened.assert_called_once_with('/owned/canary', 'wb')
+            connected.assert_called_once_with(('127.0.0.1', 12345), timeout=0.5)
+            if expected_false:
+                self.assertFalse(observation[expected_false])
+            else:
+                self.assertTrue(all(observation.values()))
+        # Successful write/connect must make the denial proof false.
+        with mock.patch.object(Path, 'read_text', read), mock.patch.object(os, 'getuid', return_value=1001), mock.patch(
+                'sys.argv', ['probe', '/owned/canary', '12345']), mock.patch('builtins.open', mock.mock_open()), mock.patch.object(
+                socket, 'create_connection', return_value=mock.MagicMock()), redirect_stdout(io.StringIO()) as output:
+            exec(ENFORCEMENT_CHILD, {})
+        self.assertFalse(json.loads(output.getvalue())['outside_write_denied'])
+        self.assertFalse(json.loads(output.getvalue())['loopback_connect_denied'])
+
+    def test_enforcement_parent_controls_one_request_and_unchanged_canary(self):
+        from scripts import ci_codex_sandbox as sandbox
+        provider = mock.Mock()
+        provider.response.return_value = {'exitCode': 0, 'stdout': json.dumps({key: True for key in ENFORCEMENT_KEYS}), 'stderr': ''}
+        listener = mock.MagicMock()
+        listener.getsockname.return_value = ('127.0.0.1', 12345)
+        listener.accept.side_effect = [(mock.MagicMock(), None), TimeoutError()]
+        connection = mock.MagicMock()
+        connection.__enter__.return_value.recv.return_value = b'ok'
+        writes = []
+        def write(path, value):
+            writes.append(value)
+        def read(path):
+            return writes[-1] if path.name == 'canary' else b'pinned'
+        with mock.patch.object(sandbox, 'target'), mock.patch.object(sandbox, 'chain'), mock.patch.object(sandbox, 'identity'), mock.patch.object(
+                sandbox, 'digest', return_value=sandbox.RESOURCE_HASH), mock.patch.object(shutil, 'which', return_value=str(sandbox.BWRAP)), mock.patch.object(
+                subprocess, 'run', return_value=mock.Mock(returncode=0, stdout=b'--as-pid-1 --perms --argv0 --ro-bind-fd')), mock.patch.object(
+                Path, 'home', return_value=Path('/home/runner')), mock.patch.object(Path, 'read_bytes', read), mock.patch.object(
+                Path, 'write_bytes', write), mock.patch.object(tempfile, 'TemporaryDirectory') as temporary, mock.patch.object(
+                socket, 'socket') as socket_factory, mock.patch.object(socket, 'create_connection', return_value=connection):
+            temporary.return_value.__enter__.return_value = '/home/runner/herdr-codex-denial-owned'
+            socket_factory.return_value.__enter__.return_value = listener
+            observation = linux_enforcement(provider, Path('/tmp/owned'), '/pinned/python')
+        self.assertTrue(all(observation.values()))
+        self.assertEqual(writes, [b'parent-control', b'owned-before'])
+        provider.request.assert_called_once()
+        method, params = provider.request.call_args.args
+        self.assertEqual(method, 'command/exec')
+        self.assertEqual(set(params), {'command', 'cwd', 'timeoutMs'})
+        self.assertEqual(params['timeoutMs'], 10000)
+        self.assertEqual(params['cwd'], '/tmp/owned')
+        self.assertEqual(params['command'][:3], ['/pinned/python', '-c', ENFORCEMENT_CHILD])
+        provider.response.assert_called_once_with(provider.request.return_value, timeout=30)
+
+    def test_enforcement_cli_rejects_non_ci_nonlinux_root_and_diagnostic_combination(self):
+        env = {'CI': 'true', 'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'bfirestone/herdr',
+               'GITHUB_REF': 'refs/heads/feat/desktop-exact-delivery'}
+        argv = ['proof', '--provider-fixtures-only', '--require-linux-enforcement', '--session', 'unused',
+                '--scratch', '/unused', '--provider-path', '/unused', '--herdr-bin', '/unused']
+        for platform, uid, changes, extra, accepted in [('linux', 1001, {}, [], True),
+                ('darwin', 1001, {}, [], False), ('linux', 0, {}, [], False),
+                ('linux', 1001, {'CI': 'false'}, [], False), ('linux', 1001, {}, ['--diagnose-provider-runtime'], False),
+                ('linux', 1001, {'GITHUB_REF': 'refs/heads/master'}, [], False)]:
+            with mock.patch('sys.argv', argv + extra), mock.patch.object(os.sys, 'platform', platform), mock.patch.object(
+                    os, 'geteuid', return_value=uid), mock.patch.dict(os.environ, dict(env, **changes), clear=True), mock.patch(
+                    __name__ + '.provider_fixtures', return_value=17) as fixtures, mock.patch('sys.stderr', io.StringIO()):
+                if accepted:
+                    self.assertEqual(main(), 17)
+                    fixtures.assert_called_once()
+                else:
+                    with self.assertRaises(SystemExit):
+                        main()
+                    fixtures.assert_not_called()
+
     def diagnostic_fixture(self, results, enabled=True, platform='linux', cleanup_error=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1585,6 +1796,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--strict-test-policy', action='store_true', help='user-approved disposable-only on-request/manual consent; never changes saved settings or sandbox policy')
     parser.add_argument('--provider-fixtures-only', action='store_true', help='opt-in shipped-binary tool/hook/MCP descriptor fixtures; no model calls')
+    parser.add_argument('--require-linux-enforcement', action='store_true', help='reviewed Linux CI provider fixtures only: require child enforcement and owned denial evidence')
     parser.add_argument('--diagnose-provider-runtime', action='store_true', help='Linux provider-fixtures-only: two bounded supplemental probes after a failed null control')
     parser.add_argument('--session', required=True, help='new codex-proof-<32 random hex> session')
     parser.add_argument('--scratch', required=True, type=Path, help='nonexistent canonical absolute /.../herdr-codex-<same hex>')
@@ -1594,6 +1806,12 @@ def main():
     args = parser.parse_args()
     if args.diagnose_provider_runtime and (not args.provider_fixtures_only or os.sys.platform != 'linux'):
         parser.error('--diagnose-provider-runtime requires --provider-fixtures-only on Linux')
+    if args.require_linux_enforcement:
+        if (not args.provider_fixtures_only or os.sys.platform != 'linux' or args.diagnose_provider_runtime or
+                os.environ.get('CI') != 'true' or os.environ.get('GITHUB_ACTIONS') != 'true' or
+                os.environ.get('GITHUB_REPOSITORY') != 'bfirestone/herdr' or
+                os.environ.get('GITHUB_REF') != 'refs/heads/feat/desktop-exact-delivery' or os.geteuid() == 0):
+            parser.error('--require-linux-enforcement requires the nonroot reviewed Linux CI candidate')
     try:
         return provider_fixtures(args) if args.provider_fixtures_only else live(args)
     except (ProofFailure, subprocess.TimeoutExpired) as error:
