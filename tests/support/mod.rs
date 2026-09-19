@@ -177,10 +177,15 @@ impl HandoffFixture {
             if birth < helper_birth {
                 continue;
             }
-            let parent = match test_process_parent(pid) {
-                Ok(parent) => parent,
-                Err(_) if test_process_birth(pid)? != Some(birth) => continue,
-                Err(error) => return Err(error),
+            let Some(parent) = resolve_identity_inspection(
+                pid,
+                birth,
+                "initial helper child parent",
+                test_process_parent(pid),
+                test_process_birth,
+            )?
+            else {
+                continue;
             };
             if parent != helper_pid {
                 continue;
@@ -188,10 +193,24 @@ impl HandoffFixture {
             // A freshly forked direct child may still show the helper executable.
             // Wait only for this proven child to settle to the exact Cargo binary.
             if let Some(identity) = settled_herdr_identity_before(pid, end)? {
-                if identity.birth != birth || test_process_parent(pid)? != helper_pid {
-                    return Err(bad_inspection(
-                        "helper child identity changed during capture",
-                    ));
+                if identity.birth != birth {
+                    continue;
+                }
+                let Some(parent) = resolve_identity_inspection(
+                    pid,
+                    birth,
+                    "final helper child parent",
+                    test_process_parent(pid),
+                    test_process_birth,
+                )?
+                else {
+                    continue;
+                };
+                if test_process_birth(pid)? != Some(birth) {
+                    continue;
+                }
+                if parent != helper_pid {
+                    return Err(bad_inspection("helper child parent changed during capture"));
                 }
                 // Keep each proven child even if a later candidate cannot be
                 // inspected or the bounded inventory fails.
@@ -541,15 +560,35 @@ fn test_process_parent(pid: u32) -> std::io::Result<u32> {
 }
 
 pub fn test_process_identity(pid: u32) -> std::io::Result<Option<TestProcessIdentity>> {
-    let Some(birth) = test_process_birth(pid)? else {
+    test_process_identity_from(pid, test_process_birth, process_executable)
+}
+
+fn test_process_identity_from(
+    pid: u32,
+    mut read_birth: impl FnMut(u32) -> std::io::Result<Option<(u64, u64)>>,
+    mut read_executable: impl FnMut(u32) -> std::io::Result<PathBuf>,
+) -> std::io::Result<Option<TestProcessIdentity>> {
+    let Some(birth) = read_birth(pid)
+        .map_err(|error| bad_inspection(&format!("initial identity birth PID {pid}: {error}")))?
+    else {
         return Ok(None);
     };
-    let executable = match process_executable(pid) {
-        Ok(path) => path,
-        Err(_) if test_process_birth(pid)?.is_none() => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(executable) = resolve_identity_inspection(
+        pid,
+        birth,
+        "identity executable",
+        read_executable(pid),
+        &mut read_birth,
+    )?
+    else {
+        return Ok(None);
     };
-    if test_process_birth(pid)? != Some(birth) {
+    if read_birth(pid).map_err(|error| {
+        bad_inspection(&format!(
+            "final identity birth PID {pid} birth {birth:?}: {error}"
+        ))
+    })? != Some(birth)
+    {
         return Ok(None);
     }
     Ok(Some(TestProcessIdentity {
@@ -559,6 +598,29 @@ pub fn test_process_identity(pid: u32) -> std::io::Result<Option<TestProcessIden
         import_socket: None,
         runtime_dir: None,
     }))
+}
+
+// An errno alone never establishes exit. Compare against the captured birth,
+// including when a metadata probe failed before its normal final identity check.
+fn resolve_identity_inspection<T>(
+    pid: u32,
+    birth: (u64, u64),
+    operation: &str,
+    result: std::io::Result<T>,
+    mut read_birth: impl FnMut(u32) -> std::io::Result<Option<(u64, u64)>>,
+) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => match read_birth(pid) {
+            Ok(current) if current != Some(birth) => Ok(None),
+            Ok(_) => Err(bad_inspection(&format!(
+                "{operation} PID {pid} birth {birth:?}: {error}; recorded identity remains live"
+            ))),
+            Err(recheck) => Err(bad_inspection(&format!(
+                "{operation} PID {pid} birth {birth:?}: {error}; birth recheck failed: {recheck}"
+            ))),
+        },
+    }
 }
 
 // macOS can briefly report the spawning executable after spawn() returns.
@@ -782,14 +844,15 @@ fn discover_imports(
             Some((target, error)) if target == pid => Err(std::io::Error::from_raw_os_error(error)),
             _ => inspected,
         };
-        let executable = match inspected {
-            Ok(path) => path,
-            Err(_) if test_process_birth(pid)? != Some(birth) => continue,
-            Err(e) => {
-                return Err(bad_inspection(&format!(
-                    "executable inventory PID {pid}: {e}"
-                )))
-            }
+        let Some(executable) = resolve_identity_inspection(
+            pid,
+            birth,
+            "executable inventory",
+            inspected,
+            test_process_birth,
+        )?
+        else {
+            continue;
         };
         if !is_test_herdr_binary(&executable) {
             continue;
@@ -798,30 +861,34 @@ fn discover_imports(
             let Some(mut identity) = test_process_identity(pid)? else {
                 return Ok(None);
             };
-            if !is_test_herdr_binary(&identity.executable) {
+            if identity.birth != birth || !is_test_herdr_binary(&identity.executable) {
                 return Ok(None);
             }
             let args = handoff_argv(pid)?;
+            if test_process_birth(pid)? != Some(birth) {
+                return Ok(None);
+            }
             identity.import_socket = exact_import_socket(&args, &ownership.data_dirs);
             Ok(identity.import_socket.is_some().then_some(identity))
         })();
-        match result {
-            Ok(Some(identity)) => {
-                write_fixture_ledger(
+        if let Some(identity) = resolve_identity_inspection(
+            pid,
+            birth,
+            "import identity/argv inventory",
+            result,
+            test_process_birth,
+        )?
+        .flatten()
+        {
+            write_fixture_ledger(
                     serde_json::json!({"pid": identity.pid, "birth": identity.birth, "executable": identity.executable, "kind": "import", "socket": identity.import_socket}),
-                )?;
-                if !ownership.imports.contains(&identity) {
-                    ownership.imports.push(identity.clone());
-                }
-                found.push(identity);
+                ).map_err(|error| bad_inspection(&format!(
+                    "import ledger PID {pid} birth {birth:?}: {error}"
+                )))?;
+            if !ownership.imports.contains(&identity) {
+                ownership.imports.push(identity.clone());
             }
-            Ok(None) => {}
-            Err(_) if test_process_birth(pid)?.is_none() => {}
-            Err(e) => {
-                return Err(bad_inspection(&format!(
-                    "import identity/argv inventory PID {pid}: {e}"
-                )))
-            }
+            found.push(identity);
         }
     }
     Ok(found)
@@ -855,32 +922,64 @@ fn same_process(expected: &TestProcessIdentity, current: Option<&TestProcessIden
 }
 
 fn identity_still_owned(identity: &TestProcessIdentity) -> std::io::Result<bool> {
-    let Some(current) = test_process_identity(identity.pid)? else {
-        return Ok(false);
-    };
-    if !same_process(identity, Some(&current)) {
-        return Ok(false);
-    }
-    if let Some(runtime) = &identity.runtime_dir {
-        if process_runtime_dir(identity.pid)?.as_ref() != Some(runtime)
-            || !read_cmdline(identity.pid)?
+    identity_still_owned_from(
+        identity,
+        test_process_identity,
+        test_process_birth,
+        process_runtime_dir,
+        read_cmdline,
+        handoff_argv,
+    )
+}
+
+fn identity_still_owned_from(
+    identity: &TestProcessIdentity,
+    mut read_identity: impl FnMut(u32) -> std::io::Result<Option<TestProcessIdentity>>,
+    read_birth: impl FnMut(u32) -> std::io::Result<Option<(u64, u64)>>,
+    mut read_runtime: impl FnMut(u32) -> std::io::Result<Option<PathBuf>>,
+    mut read_server_args: impl FnMut(u32) -> std::io::Result<Vec<String>>,
+    mut read_import_args: impl FnMut(u32) -> std::io::Result<Vec<String>>,
+) -> std::io::Result<bool> {
+    let mut operation = "initial identity";
+    let result = (|| {
+        let Some(current) = read_identity(identity.pid)? else {
+            return Ok(false);
+        };
+        if !same_process(identity, Some(&current)) {
+            return Ok(false);
+        }
+        if let Some(runtime) = &identity.runtime_dir {
+            operation = "runtime environment";
+            if read_runtime(identity.pid)?.as_ref() != Some(runtime) {
+                return Ok(false);
+            }
+            operation = "server argv";
+            if !read_server_args(identity.pid)?
                 .iter()
                 .any(|arg| arg == "server")
-        {
-            return Ok(false);
+            {
+                return Ok(false);
+            }
         }
-    }
-    if let Some(socket) = &identity.import_socket {
-        let args = handoff_argv(identity.pid)?;
-        let dirs = HashSet::from([socket.parent().unwrap().to_path_buf()]);
-        if exact_import_socket(&args, &dirs).as_ref() != Some(socket) {
-            return Ok(false);
+        if let Some(socket) = &identity.import_socket {
+            operation = "import argv";
+            let args = read_import_args(identity.pid)?;
+            let dirs = HashSet::from([socket.parent().unwrap().to_path_buf()]);
+            if exact_import_socket(&args, &dirs).as_ref() != Some(socket) {
+                return Ok(false);
+            }
         }
+        operation = "final identity";
+        Ok(same_process(
+            identity,
+            read_identity(identity.pid)?.as_ref(),
+        ))
+    })();
+    match resolve_identity_inspection(identity.pid, identity.birth, operation, result, read_birth)?
+    {
+        Some(owned) => Ok(owned),
+        None => Ok(false),
     }
-    Ok(same_process(
-        identity,
-        test_process_identity(identity.pid)?.as_ref(),
-    ))
 }
 
 pub fn terminate_test_process(
@@ -897,7 +996,10 @@ pub fn terminate_test_process(
         {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() != Some(libc::ESRCH) {
-                return Err(e);
+                return Err(bad_inspection(&format!(
+                    "signal {signal} PID {} birth {:?}: {e}",
+                    identity.pid, identity.birth
+                )));
             }
         }
         let end = deadline.min(Instant::now() + grace);
@@ -956,32 +1058,45 @@ fn finish_handoff_fixture(state: &FixtureState) -> std::io::Result<()> {
                         ownership.producers.push(identity)
                     }
                     Ok(_) => {}
-                    Err(error) => journal_error = Some(error),
+                    Err(error) => {
+                        journal_error = Some(bad_inspection(&format!("producer journal: {error}")))
+                    }
                 }
             }
             if !journal.is_empty() && !journal.ends_with('\n') {
                 journal_error = Some(bad_inspection("incomplete producer journal"));
             }
         }
-        Err(error) => journal_error = Some(error),
+        Err(error) => journal_error = Some(bad_inspection(&format!("producer journal: {error}"))),
     }
-    if ownership.base.join("pending-startup").try_exists()? {
+    if ownership
+        .base
+        .join("pending-startup")
+        .try_exists()
+        .map_err(|error| bad_inspection(&format!("pending-startup marker: {error}")))?
+    {
         journal_error = Some(bad_inspection(
             "nested child startup ownership is incomplete",
         ));
     }
     for producer in ownership.producers.clone() {
-        if identity_still_owned(&producer)? {
+        if identity_still_owned(&producer)
+            .map_err(|error| bad_inspection(&format!("producer inspection: {error}")))?
+        {
             ownership.terminated_servers += 1;
         }
-        terminate_test_process(&producer, deadline)?;
+        terminate_test_process(&producer, deadline)
+            .map_err(|error| bad_inspection(&format!("producer cleanup: {error}")))?;
         unregister_spawned_herdr_pid(Some(producer.pid));
     }
     for import in ownership.imports.clone() {
-        if identity_still_owned(&import)? {
+        if identity_still_owned(&import)
+            .map_err(|error| bad_inspection(&format!("recorded import inspection: {error}")))?
+        {
             ownership.terminated_servers += 1;
         }
-        terminate_test_process(&import, deadline)?;
+        terminate_test_process(&import, deadline)
+            .map_err(|error| bad_inspection(&format!("recorded import cleanup: {error}")))?;
     }
     if ownership.starting {
         return Err(bad_inspection("fixture still owns pending startup"));
@@ -999,7 +1114,8 @@ fn finish_handoff_fixture(state: &FixtureState) -> std::io::Result<()> {
                     return Err(error);
                 }
                 if !ownership.borrowed {
-                    fs::remove_dir_all(&ownership.base)?;
+                    fs::remove_dir_all(&ownership.base)
+                        .map_err(|error| bad_inspection(&format!("fixture removal: {error}")))?;
                 }
                 unregister_runtime_dir(&ownership.base.join("runtime"));
                 fixture_registry().remove(&ownership.base);
@@ -1009,10 +1125,14 @@ fn finish_handoff_fixture(state: &FixtureState) -> std::io::Result<()> {
         } else {
             empty_scans = 0;
             for import in imports {
-                if identity_still_owned(&import)? {
+                if identity_still_owned(&import).map_err(|error| {
+                    bad_inspection(&format!("discovered import inspection: {error}"))
+                })? {
                     ownership.terminated_servers += 1;
                 }
-                terminate_test_process(&import, deadline)?;
+                terminate_test_process(&import, deadline).map_err(|error| {
+                    bad_inspection(&format!("discovered import cleanup: {error}"))
+                })?;
             }
         }
         thread::sleep(Duration::from_millis(40));
@@ -1878,6 +1998,203 @@ mod tests {
         wrong_exe.executable = "/installed/herdr".into();
         assert!(!same_process(&expected, Some(&wrong_exe)));
         assert!(!is_test_herdr_binary(Path::new("/installed/herdr")));
+    }
+
+    fn inspection_identity() -> TestProcessIdentity {
+        TestProcessIdentity {
+            pid: 42,
+            birth: (123, 4),
+            executable: "/cargo/herdr".into(),
+            import_socket: Some("/owned/data/herdr-handoff-12.sock".into()),
+            runtime_dir: None,
+        }
+    }
+
+    #[test]
+    fn ownership_inspection_exit_during_import_argv() {
+        let expected = inspection_identity();
+        for birth in [None, Some((124, 4))] {
+            let result = identity_still_owned_from(
+                &expected,
+                |_| Ok(Some(expected.clone())),
+                |_| Ok(birth),
+                |_| panic!("unexpected runtime read"),
+                |_| panic!("unexpected server argv read"),
+                |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            );
+            assert!(
+                !result.unwrap(),
+                "gone identity must not authorize signaling"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_inspection_failed_executable_changed_birth() {
+        let mut births = [Some((123, 4)), Some((124, 4))].into_iter();
+        assert!(test_process_identity_from(
+            42,
+            |_| Ok(births.next().unwrap()),
+            |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn ownership_inspection_errors_require_positive_disappearance() {
+        let mut expected = inspection_identity();
+        expected.runtime_dir = Some("/owned/runtime".into());
+        for operation in [
+            "initial identity",
+            "runtime environment",
+            "server argv",
+            "import argv",
+            "final identity",
+        ] {
+            for errno in [
+                libc::ESRCH,
+                libc::ENOENT,
+                libc::EPERM,
+                libc::EACCES,
+                libc::EIO,
+                libc::EINVAL,
+            ] {
+                // Absent, replaced, still live, and uncertain kernel birth.
+                for outcome in 0..4 {
+                    let mut identity_reads = 0;
+                    let result = identity_still_owned_from(
+                        &expected,
+                        |_| {
+                            identity_reads += 1;
+                            let probe = if identity_reads == 1 {
+                                "initial identity"
+                            } else {
+                                "final identity"
+                            };
+                            if operation == probe {
+                                Err(std::io::Error::from_raw_os_error(errno))
+                            } else {
+                                Ok(Some(expected.clone()))
+                            }
+                        },
+                        |_| match outcome {
+                            0 => Ok(None),
+                            1 => Ok(Some((124, 4))),
+                            2 => Ok(Some(expected.birth)),
+                            _ => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                        },
+                        |_| {
+                            if operation == "runtime environment" {
+                                Err(std::io::Error::from_raw_os_error(errno))
+                            } else {
+                                Ok(expected.runtime_dir.clone())
+                            }
+                        },
+                        |_| {
+                            if operation == "server argv" {
+                                Err(std::io::Error::from_raw_os_error(errno))
+                            } else {
+                                Ok(vec!["server".into()])
+                            }
+                        },
+                        |_| {
+                            if operation == "import argv" {
+                                Err(std::io::Error::from_raw_os_error(errno))
+                            } else {
+                                Ok(vec![
+                                    "/cargo/herdr".into(),
+                                    "server".into(),
+                                    "--handoff-import".into(),
+                                    expected
+                                        .import_socket
+                                        .as_ref()
+                                        .unwrap()
+                                        .display()
+                                        .to_string(),
+                                    "PRIVATE_TOKEN".into(),
+                                ])
+                            }
+                        },
+                    );
+                    if outcome < 2 {
+                        assert!(
+                            !result.unwrap(),
+                            "{operation}: gone process cannot authorize signaling"
+                        );
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains(operation), "{error}");
+                        assert!(error.contains("PID 42 birth (123, 4)"), "{error}");
+                        assert!(
+                            error.contains(&std::io::Error::from_raw_os_error(errno).to_string()),
+                            "{error}"
+                        );
+                        assert_eq!(
+                            error.contains("birth recheck failed"),
+                            outcome == 3,
+                            "{error}"
+                        );
+                        assert!(!error.contains("PRIVATE_TOKEN"));
+                        assert!(!error.contains("/owned/runtime"));
+                    }
+                }
+            }
+        }
+        assert!(identity_still_owned_from(
+            &expected,
+            |_| Ok(Some(expected.clone())),
+            |_| panic!("successful probes need no error recheck"),
+            |_| Ok(expected.runtime_dir.clone()),
+            |_| Ok(vec!["server".into()]),
+            |_| Ok(vec![
+                "/cargo/herdr".into(),
+                "server".into(),
+                "--handoff-import".into(),
+                expected
+                    .import_socket
+                    .as_ref()
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                "PRIVATE_TOKEN".into()
+            ]),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn ownership_inspection_executable_errors_preserve_live_uncertainty() {
+        for outcome in 0..4 {
+            let mut reads = 0;
+            let result = test_process_identity_from(
+                42,
+                |_| {
+                    reads += 1;
+                    if reads == 1 {
+                        return Ok(Some((123, 4)));
+                    }
+                    match outcome {
+                        0 => Ok(None),
+                        1 => Ok(Some((124, 4))),
+                        2 => Ok(Some((123, 4))),
+                        _ => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                    }
+                },
+                |_| Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+            );
+            if outcome < 2 {
+                assert!(result.unwrap().is_none());
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("identity executable PID 42 birth (123, 4)"),
+                    "{error}"
+                );
+                assert!(error.contains(&std::io::Error::from_raw_os_error(libc::ESRCH).to_string()));
+                assert_eq!(error.contains("birth recheck failed"), outcome == 3);
+            }
+        }
     }
 
     #[test]
