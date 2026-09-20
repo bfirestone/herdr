@@ -110,3 +110,46 @@ jobs:
                   failures.append(name)
           assert not failures, 'unverified provider fixtures: ' + ', '.join(failures)
           PY
+      - name: Install exact Claude only in disposable runner tools
+        run: npm install --prefix "$RUNNER_TEMP/herdr-claude-provider" --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.276
+      - name: Claude native and shipped npm fallback hook and MCP descriptors
+        # No model request, login, API key or production settings. The native
+        # process and each real hook/MCP child are observed separately from Codex.
+        run: |
+          python3 - <<'CLAUDE_PY'
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import uuid
+          tools = Path(os.environ['RUNNER_TEMP']) / 'herdr-claude-provider/node_modules/@anthropic-ai'
+          system = {'Darwin': 'darwin', 'Linux': 'linux'}[platform.system()]
+          cpu = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64'}[platform.machine()]
+          native = tools / ('claude-code-' + system + '-' + cpu) / 'claude'
+          wrapper = tools / 'claude-code/cli-wrapper.cjs'
+          assert native.is_file() and wrapper.is_file()
+          node = shutil.which('node')
+          assert node
+          support = Path(tempfile.mkdtemp(prefix='hx-cl-', dir='/tmp')).resolve()
+          launcher = support / 'claude-npm-fallback'
+          launcher.write_text('#!' + sys.executable + '\nimport os,sys\nos.execv(' + repr(node)
+              + ', [' + repr(node) + ', ' + repr(str(wrapper)) + ', *sys.argv[1:]])\n')
+          launcher.chmod(0o700)
+          failures = []
+          for name, provider in [('native', native), ('npm-fallback', launcher)]:
+              nonce = uuid.uuid4().hex
+              env = os.environ.copy()
+              env['CLAUDE_CONFIG_DIR'] = str(support / (name + '-config'))
+              result = subprocess.run([
+                  sys.executable, 'scripts/test_integrated_claude.py', '--descriptor-probe-only',
+                  '--session', 'claude-proof-' + nonce,
+                  '--scratch', str(Path(tempfile.gettempdir()).resolve() / ('herdr-claude-' + nonce)),
+                  '--provider-path', str(provider.resolve()),
+              ], env=env, check=False)
+              if result.returncode:
+                  failures.append(name)
+          assert not failures, 'unverified Claude descriptors: ' + ', '.join(failures)
+          CLAUDE_PY

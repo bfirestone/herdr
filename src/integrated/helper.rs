@@ -720,6 +720,304 @@ while True:
 mod claude_tests {
     use super::*;
     use crate::integrated::{Owner, OwnerState, ProviderKind, SubmissionOutcome};
+
+    #[cfg(unix)]
+    mod schedules {
+        use super::*;
+        use std::io::BufRead;
+
+        const PROVIDER: &str = r#"
+import json,sys,os,socket,select,signal
+signal.alarm(20)
+mode=os.environ['HERDR_FIXTURE_MODE'];session=os.environ['HERDR_FIXTURE_SESSION']
+observer=socket.create_connection(('127.0.0.1',int(os.environ['HERDR_FIXTURE_OBSERVER'])))
+sync=observer.makefile('rwb',buffering=0)
+def observe(value):sync.write((value+'\n').encode())
+def release():assert sync.readline()==b'continue\n'
+def read():return json.loads(sys.stdin.buffer.readline())
+def send(value):print(json.dumps(value),flush=True)
+a=read();assert a['request']['subtype']=='initialize'
+send({'type':'control_response','response':{'subtype':'success','request_id':'initialize',
+ 'pending_permission_requests':[],'pending_user_dialog_requests':[],
+ 'response':{'commands':[],'agents':[],'models':[],'output_style':'default'}}})
+a=read();assert a['request']['subtype']=='get_binary_version'
+send({'type':'control_response','response':{'subtype':'success','request_id':a['request_id'],'response':{'version':'2.1.276'}}})
+observe('holding-input')
+if mode=='partial':
+ first=os.read(0,1);assert first==b'{'
+ observe('partial-byte');release()
+ remaining=sys.stdin.buffer.read()
+ assert remaining and not remaining.endswith(b'\n'), 'write was not actually partial'
+ observe('partial-captured')
+ release()
+elif mode=='queued':
+ assert select.select([sys.stdin],[],[],5)[0]
+ observe('input-buffered');release()
+ a=read();assert a['type']=='user' and a['session_id']==session and a['parent_tool_use_id'] is None
+ assert a['message']['content']=='old queued text'
+ a['isReplay']=True;send(a);observe('late-replay')
+ release()
+elif mode=='replacement':
+ release()
+ assert not select.select([sys.stdin],[],[],0)[0], 'replacement inherited old input'
+ observe('empty-input')
+ a=read();assert a['type']=='user' and a['session_id']==session and a['parent_tool_use_id'] is None
+ assert a['message']['content']=='new own text'
+ assert a['message']['content'] not in str(sys.argv) and a['message']['content'] not in str(dict(os.environ))
+ assert os.listdir('.')==[]
+ observe('own-input');a['isReplay']=True;send(a)
+ send({'type':'result','session_id':session,'subtype':'success'})
+ sys.stdin.read()
+elif mode=='approval':
+ a=read();assert a['type']=='user' and a['session_id']==session
+ assert a['message']['content']=='old queued text'
+ a['isReplay']=True;send(a)
+ send({'type':'control_request','request_id':'old-consent','request':{
+  'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'old-tool',
+  'input':{'command':'printf safe','timeout':2000}}})
+ observe('old-card-issued');release()
+ assert sys.stdin.buffer.read()==b'', 'retired card generated provider response'
+ observe('no-old-decision');release()
+else:raise AssertionError('unknown schedule')
+"#;
+
+        struct Fixture {
+            owner: Arc<Owner>,
+            ui: mpsc::SyncSender<Input>,
+            observer: Option<BufReader<std::net::TcpStream>>,
+            helper: Option<std::thread::JoinHandle<io::Result<()>>>,
+            arrived: mpsc::Receiver<()>,
+            release_cleanup: mpsc::SyncSender<()>,
+            directory: std::path::PathBuf,
+        }
+        impl Fixture {
+            fn new(mode: &str, token: &str) -> Self {
+                let bootstrap = crate::platform::RecipientBootstrap::new().unwrap();
+                let directory = std::env::temp_dir().join(format!(
+                    "claude-schedule-{}",
+                    crate::platform::recipient_random().unwrap()
+                ));
+                std::fs::create_dir(&directory).unwrap();
+                let directory = directory.canonicalize().unwrap();
+                let args = vec![
+                    bootstrap.path().to_string_lossy().into_owned(),
+                    bootstrap.nonce.clone(),
+                    directory.to_string_lossy().into_owned(),
+                ];
+                let owner = Owner::launch(
+                    ProviderKind::Claude,
+                    RecipientIdentity {
+                        server_instance: "schedule-server".into(),
+                        recipient_token: token.into(),
+                        terminal_id: "same-terminal".into(),
+                    },
+                    bootstrap,
+                    std::process::id(),
+                );
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let mut command = Command::new("python3");
+                command
+                    .args(["-u", "-c", PROVIDER])
+                    .env("HERDR_FIXTURE_MODE", mode)
+                    .env(
+                        "HERDR_FIXTURE_OBSERVER",
+                        listener.local_addr().unwrap().port().to_string(),
+                    )
+                    .env("HERDR_FIXTURE_SESSION", token);
+                let (ui, ui_rx) = mpsc::sync_channel(1);
+                let (arrived_tx, arrived) = mpsc::sync_channel(1);
+                let (release_cleanup, release_rx) = mpsc::sync_channel(1);
+                let protocol = Protocol::Claude(super::super::super::claude::Claude::new(
+                    args[2].clone(),
+                    token.into(),
+                ));
+                let helper = std::thread::spawn(move || {
+                    run_protocol(
+                        &args,
+                        command,
+                        protocol,
+                        false,
+                        Some((arrived_tx, release_rx)),
+                        Some(ui_rx),
+                    )
+                });
+                let mut fixture = Self {
+                    owner,
+                    ui,
+                    observer: None,
+                    helper: Some(helper),
+                    arrived,
+                    release_cleanup,
+                    directory,
+                };
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "fixture observer deadline");
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("fixture observer: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                fixture.observer = Some(BufReader::new(stream));
+                fixture.expect("holding-input");
+                fixture
+                    .owner
+                    .wait_for_phase(OwnerState::AwaitingSessionConfirmation);
+                fixture
+            }
+            fn expect(&mut self, expected: &str) {
+                let mut line = String::new();
+                self.observer
+                    .as_mut()
+                    .unwrap()
+                    .read_line(&mut line)
+                    .unwrap();
+                assert_eq!(line.trim_end(), expected);
+            }
+            fn release(&mut self) {
+                self.observer
+                    .as_mut()
+                    .unwrap()
+                    .get_mut()
+                    .write_all(b"continue\n")
+                    .unwrap();
+            }
+            fn retired(&self) {
+                self.arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+                self.owner.wait_for_phase(OwnerState::Revoked);
+            }
+            fn finish(mut self, kind: io::ErrorKind) {
+                self.owner.revoke();
+                self.release_cleanup.try_send(()).unwrap();
+                assert_eq!(
+                    self.helper
+                        .take()
+                        .unwrap()
+                        .join()
+                        .unwrap()
+                        .unwrap_err()
+                        .kind(),
+                    kind
+                );
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                self.owner.revoke();
+                let _ = self.release_cleanup.try_send(());
+                if let Some(helper) = self.helper.take() {
+                    let _ = helper.join();
+                }
+                let _ = std::fs::remove_dir(&self.directory);
+            }
+        }
+        #[test]
+        fn claude_buffered_and_partial_input_stay_with_retired_process() {
+            for mode in ["queued", "partial"] {
+                let mut old = Fixture::new(mode, "old-session");
+                let text = if mode == "partial" {
+                    format!("a{}", "\n".repeat(65535))
+                } else {
+                    "old queued text".into()
+                };
+                old.ui.send(Input::Text(text)).unwrap();
+                old.expect(if mode == "partial" {
+                    "partial-byte"
+                } else {
+                    "input-buffered"
+                });
+                if mode == "queued" {
+                    old.owner.revoke();
+                }
+                old.retired();
+                assert!(old.ui.send(Input::Text("old draft".into())).is_err());
+                let mut replacement = Fixture::new("replacement", "new-session");
+                old.release();
+                old.expect(if mode == "partial" {
+                    "partial-captured"
+                } else {
+                    "late-replay"
+                });
+                replacement.release();
+                replacement.expect("empty-input");
+                replacement
+                    .ui
+                    .send(Input::Decision(json!("old-consent"), "allow".into()))
+                    .unwrap();
+                replacement
+                    .ui
+                    .send(Input::Text("new own text".into()))
+                    .unwrap();
+                replacement.expect("own-input");
+                replacement.owner.wait_for_phase(OwnerState::Idle);
+                assert_eq!(old.owner.state(), OwnerState::Revoked);
+                assert!(replacement
+                    .owner
+                    .codex_snapshot("same-terminal", Some("schedule-server"))
+                    .exact_prompt
+                    .is_none());
+                replacement.finish(io::ErrorKind::UnexpectedEof);
+                old.finish(if mode == "partial" {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::UnexpectedEof
+                });
+            }
+        }
+
+        #[test]
+        fn claude_issued_card_and_old_ui_channel_cannot_transfer_to_replacement() {
+            let mut old = Fixture::new("approval", "old-session");
+            old.ui.send(Input::Text("old queued text".into())).unwrap();
+            old.expect("old-card-issued");
+            old.owner.wait_for_phase(OwnerState::PendingPermission);
+            old.owner.revoke();
+            old.retired();
+            assert!(old
+                .ui
+                .send(Input::Decision(json!("old-consent"), "allow".into()))
+                .is_err());
+            assert!(old.ui.send(Input::Text("old unsent draft".into())).is_err());
+            let mut replacement = Fixture::new("replacement", "new-session");
+            replacement
+                .ui
+                .send(Input::Decision(json!("old-consent"), "allow".into()))
+                .unwrap();
+            // A second event crosses the one-slot queue only after the old card
+            // decision has been processed by the replacement protocol.
+            replacement
+                .ui
+                .send(Input::Decision(json!("barrier"), "deny".into()))
+                .unwrap();
+            replacement.release();
+            replacement.expect("empty-input");
+            assert_eq!(
+                replacement.owner.state(),
+                OwnerState::AwaitingSessionConfirmation
+            );
+            old.release();
+            old.expect("no-old-decision");
+            replacement
+                .ui
+                .send(Input::Text("new own text".into()))
+                .unwrap();
+            replacement.expect("own-input");
+            replacement.owner.wait_for_phase(OwnerState::Idle);
+            replacement.finish(io::ErrorKind::UnexpectedEof);
+            old.finish(io::ErrorKind::UnexpectedEof);
+        }
+    }
     #[test]
     fn revoked_claude_decision_enters_helper_error_teardown() {
         let mut claude = super::super::claude::Claude::new("/tmp/trusted".into(), "fixed".into());

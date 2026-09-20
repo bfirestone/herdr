@@ -12,6 +12,118 @@ smoke and actual platform CI. The qualified code revision is
 `f84d5dd80df7dfbac9079486ad5836d343901d9d`. Claude implementation is present but its real-provider proof remains
 open, so this does not complete Desktop M2 SC0 or the whole M2 milestone.
 
+## Claude qualification checkpoint — unqualified
+
+Claude exact-prompt capability remains absent. Remote admission still refuses
+Claude recipients; the changes below support continued qualification work and
+do not establish T5 acceptance or reuse Codex platform proof for Claude.
+
+The audited native macOS arm64 CLI is 2.1.276 (embedded source revision
+`bc0a4292e0472d227ceecb07d892ab1a777a4926`, binary SHA-256
+`9de364db11a410d53cbbb0f6b1f18c66c90053efc9a63370072856d10db66329`).
+The SDK declarations are 0.3.276, SHA-256
+`6c0c98e0f3b269d7b811fc0e92607d73633d263c067eb72cd3527fa02fc7f213`.
+Retained source slices and actual run reports belong to T5 source revisions 1
+and 2, implementation attempt 1 in each; they are evidence for this checkpoint, not a completed
+cross-platform qualification.
+
+Source-backed admission and protocol defects now have regression coverage. Claude parses slash
+commands after JavaScript `trim()`, which removes U+FEFF. Admission now rejects
+leading slash commands behind BOM and mixed whitespace before either local or
+remote writes, while preserving admitted text bytes. This closes the observed
+ordinary-text route to `/clear`. The pinned print envelope can drop the internal
+`conversation_reset` event, so a late mismatched replay or parser reset handler
+alone cannot establish zero delivery. The remaining context-control and relaunch
+reachability audit is still required.
+
+Configured SessionStart/Setup hooks can emit lifecycle notifications before the
+initialize reply. The parser now accepts their validated schema only in the
+original session. These events do not confirm readiness, settle consent, change
+pending input, or revive a revoked owner; hook output is not projected. Invalid
+context and malformed lifecycle frames still fail closed. The actual CLI also emits
+`command_lifecycle` notifications. Validated queue/start/completion/cancellation
+states are informational: they cannot substitute for the matching input replay,
+settle a consent card, or change admission state.
+
+`scripts/test_integrated_claude.py` provides an explicit opt-in raw prerequisite
+probe, with an init-only mode and deterministic safety tests included in the
+Rust integration gate. It requires a fresh named scratch/session target, keeps
+existing authentication and defaults to unchanged permission policy, bounds I/O and waits, and reports
+fixed categories and field types instead of raw provider messages. Process
+inspection precedes launch. Cleanup always attempts to reap the owned provider
+even if closing stdin fails; child observations retain birth identity and
+separate living and zombie counts. Observed disappearance is not proof that the
+harness reaped every descendant. The report always sets `qualification: false`.
+
+Actual macOS observations established initialize/version and a matching raw
+text replay. The unchanged-policy Write probe then created its exact owned
+`deny.txt` without requesting consent; it failed `consent_not_requested` and
+never reached the Allow case. This is not Deny proof. That run observed 57
+children and ended with zero observed living or zombie children, no harness
+cleanup errors, and no supervisor survivors or emergency cleanup. Earlier failed
+initialization and unavailable-inspection attempts remain retained separately;
+supervisor cleanup does not turn uncertain harness cleanup into a pass.
+
+The subsequent real raw protocol probe passed matching Allow/Deny after the
+user authorized a stricter disposable Claude policy. The explicit
+`--manual-write-policy` probe option
+adds default mode and a Write ask rule, verifies effective default mode before
+text, and preserves saved rules and hooks. Pinned source checks deny before ask
+before allow, and routes PreToolUse hook approvals through the permission
+pipeline when an ask rule applies. The run observed two matching consent requests
+and response echoes, three completed turns, absent denied output and exact
+allowed output. It observed 78 children and ended with zero living or zombie
+children, no cleanup errors, and no supervisor survivors or emergency cleanup.
+This proves the raw prerequisite. No saved policy has been changed.
+
+Subsequent actual macOS prerequisites passed independently:
+
+- Owned SessionStart hook and MCP descriptor receipts each contained three FDs
+  and no match to the private provider input. The observation control proved that
+  the captured read-end identity survived inheritance and distinguished separate
+  pipes. A prior Darwin signed-device-number validation failure remains retained.
+- One model-requested Bash metadata command produced three observed FDs with no
+  provider-input match, matching replay and an actual scoped consent request.
+  The process-local probe added default mode and an ask rule for Bash. Existing
+  sandbox auto-allow can bypass a whole-tool Bash ask rule; this probe records
+  whether consent occurred and does not claim it always must occur.
+- An owned Herdr server/client and real integrated local composer completed the
+  harmless turn and exact Write Deny/Allow. The actual production parser accepted
+  the replay; displayed original-card scope was checked before each decision.
+  Deny left its target absent and Allow produced only the expected content.
+  Public Claude capability remained absent. This is a local integration
+  prerequisite, not a public `agent.prompt_exact` delivery claim.
+
+The corresponding hook/MCP, Bash and integrated runs observed 15, 46 and 43
+children respectively, with zero remaining living or zombie children, no harness
+cleanup errors, and no supervisor survivors or emergency cleanup. Test-only
+helper schedules also exercised actual buffered and partial writes across two
+owned provider processes, delayed old-process exit, rejected old UI drafts and
+a formerly valid old consent card that could not transfer to the replacement.
+
+Pinned source confirms the print entry route, fixed explicit session, local-only
+context-changing command types, Skill rejection of those command types, and
+argument-gated background/preload entry points. The print mutation control
+routes are absent from Herdr's typed writer allowlist. The final reachability
+review remains open until every remaining adoption caller is reconciled.
+
+The workflow adds independently pinned Claude native and shipped npm fallback
+hook/MCP descriptor runs on both macOS and Linux, without model sampling or CI
+authentication. Actual runs must pass before this workflow is platform evidence.
+The shipped npm fallback also passed the actual macOS hook/MCP descriptor
+probe, with three FDs in each receipt and no provider-input match. Both a fresh
+native repeat and the fallback run observed 13 children and zero remaining
+living or zombie children, with clean harness and supervisor reports. The
+fallback launches the native executable once with inherited stdio and exits
+with its status; normal npm installation instead hardlinks or copies the native
+executable to its command path. Remaining acceptance includes completed source
+reachability, actual Linux/macOS CI and separately enabled public exact delivery
+with real smoke. Child-role diagnostics compare birth-verified executable identity
+and command name only. They did not identify the earlier short-lived same-binary
+child, whose role remains unproven; no full argv or environment was collected.
+These owned-run observations do not resolve the separately tracked whole-suite
+process-lifetime leaks.
+
 ## Final qualification evidence
 
 [Run 35485588104](https://github.com/bfirestone/herdr/actions/runs/35485588104)

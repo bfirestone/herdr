@@ -79,7 +79,14 @@ impl Claude {
         self.cards.values().cloned().collect()
     }
     pub fn submit(&mut self, origin: SubmissionOrigin, text: String) -> Vec<Effect> {
-        let reject = if !valid_text(&text) {
+        // Pinned CLI Yw/yM parse commands after JavaScript trim(), which also
+        // removes U+FEFF. Rust whitespace alone would admit BOM-prefixed /clear.
+        // Preserve valid text byte-for-byte; this is admission, not normalization.
+        let reject = if !valid_text(&text)
+            || text
+                .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+                .starts_with('/')
+        {
             Some("invalid_text")
         } else if matches!(origin, SubmissionOrigin::Remote(_)) {
             Some("unsupported_recipient")
@@ -253,6 +260,26 @@ impl Claude {
                 ])
             }
             "system" => {
+                if matches!(
+                    frame["subtype"].as_str(),
+                    Some("hook_started" | "hook_progress" | "hook_response")
+                ) {
+                    // SDK 0.3.276 / pinned CLI emit SessionStart and Setup hook
+                    // lifecycle before the initialize reply. These bounded frames
+                    // neither confirm a session nor change admission/consent state.
+                    if frame["session_id"] != self.session
+                        || !bounded_id(&frame["uuid"])
+                        || frame
+                            .get("parent_tool_use_id")
+                            .is_some_and(|v| !v.is_null())
+                        || frame.get("subagent_type").is_some()
+                        || frame.get("agent_id").is_some()
+                        || !startup_hook(&frame)
+                    {
+                        return Err(());
+                    }
+                    return Ok(vec![]);
+                }
                 self.ordinary_context(&frame, false)?;
                 if frame["subtype"] == "init" {
                     if self.stage != 2
@@ -270,6 +297,27 @@ impl Claude {
                 if !ordinary_system(&frame) {
                     return Err(());
                 }
+                Ok(vec![])
+            }
+            "command_lifecycle" => {
+                self.ordinary_context(&frame, false)?;
+                if !bounded_id(&frame["command_uuid"])
+                    || !matches!(
+                        frame["state"].as_str(),
+                        Some(
+                            "queued"
+                                | "started"
+                                | "completed"
+                                | "cancelled"
+                                | "discarded"
+                                | "refused"
+                        )
+                    )
+                {
+                    return Err(());
+                }
+                // The pinned CLI emits queue/command notifications independently
+                // of input replay and tool consent. They acknowledge neither.
                 Ok(vec![])
             }
             "rate_limit_event" | "tool_progress" | "tool_use_summary" => {
@@ -585,6 +633,28 @@ fn ordinary_system(frame: &Value) -> bool {
         _ => false,
     }
 }
+fn startup_hook(frame: &Value) -> bool {
+    if !bounded_id(&frame["hook_id"])
+        || !frame["hook_name"].is_string()
+        || !matches!(frame["hook_event"].as_str(), Some("SessionStart" | "Setup"))
+    {
+        return false;
+    }
+    match frame["subtype"].as_str() {
+        Some("hook_started") => true,
+        Some("hook_progress" | "hook_response") => {
+            ["stdout", "stderr", "output"]
+                .iter()
+                .all(|key| frame[*key].is_string())
+                && (frame["subtype"] == "hook_progress"
+                    || (matches!(
+                        frame["outcome"].as_str(),
+                        Some("success" | "error" | "cancelled")
+                    ) && frame.get("exit_code").is_none_or(Value::is_i64)))
+        }
+        _ => false,
+    }
+}
 fn control_id(frame: &Value) -> Result<&str, ()> {
     frame["request_id"]
         .as_str()
@@ -750,6 +820,108 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+    #[test]
+    fn command_lifecycle_never_substitutes_for_replay_or_changes_admission() {
+        for state in [
+            "queued",
+            "started",
+            "completed",
+            "cancelled",
+            "discarded",
+            "refused",
+        ] {
+            let mut p = initialized();
+            let submitted = submitted(&mut p);
+            let frame = json!({"type":"command_lifecycle","session_id":"fixed-session",
+                "uuid":"event","command_uuid":submitted["uuid"],"state":state});
+            assert!(p.event(frame.clone()).unwrap().is_empty());
+            assert!(!p.confirmed);
+            assert!(p.pending.is_some());
+            assert_eq!(p.state, OwnerState::ActiveTurn);
+            p.event(replay(submitted)).unwrap();
+            p.event(request("consent", "Bash", json!({"command":"printf safe"})))
+                .unwrap();
+            assert!(p.event(frame.clone()).unwrap().is_empty());
+            assert_eq!(p.state, OwnerState::PendingPermission);
+            assert_eq!(p.cards.len(), 1);
+            for (key, value) in [
+                ("session_id", json!("replacement")),
+                ("uuid", Value::Null),
+                ("command_uuid", Value::Null),
+                ("state", json!("reset")),
+                ("parent_tool_use_id", json!("child")),
+            ] {
+                let mut invalid = frame.clone();
+                invalid[key] = value;
+                assert!(p.event(invalid).is_err());
+            }
+            p.state = OwnerState::Revoked;
+            assert!(p.event(frame).is_err());
+        }
+    }
+    #[test]
+    fn startup_hook_lifecycle_is_informational_before_initialize_and_during_turn() {
+        for subtype in ["hook_started", "hook_progress", "hook_response"] {
+            let frame = json!({"type":"system","subtype":subtype,"session_id":"fixed-session","uuid":"event-id","hook_id":"hook-id","hook_name":"configured hook","hook_event":"SessionStart","stdout":"untrusted output","stderr":"","output":"untrusted output","outcome":"success","exit_code":0});
+            let mut p = Claude::new("/tmp/trusted".into(), "fixed-session".into());
+            assert!(p.event(frame.clone()).unwrap().is_empty());
+            assert_eq!(p.state, OwnerState::Starting);
+            assert_eq!(p.stage, 0);
+            assert!(!p.confirmed);
+            let mut p = initialized();
+            let sent = submitted(&mut p);
+            assert!(p.event(frame.clone()).unwrap().is_empty());
+            assert_eq!(p.state, OwnerState::ActiveTurn);
+            assert_eq!(p.pending.as_ref().unwrap().uuid, sent["uuid"]);
+            assert!(!p.confirmed);
+            for (key, value) in [
+                ("session_id", json!("replacement")),
+                ("uuid", Value::Null),
+                ("hook_id", Value::Null),
+                ("hook_name", json!({})),
+                ("hook_event", json!("unknown")),
+                ("parent_tool_use_id", json!("child")),
+                ("agent_id", json!("child")),
+            ] {
+                let mut wrong = frame.clone();
+                wrong[key] = value;
+                assert!(p.event(wrong).is_err(), "admitted invalid {key}");
+            }
+            p.state = OwnerState::Revoked;
+            assert!(p.event(frame).is_err());
+        }
+    }
+    #[test]
+    fn javascript_trim_cannot_hide_a_context_command_from_admission() {
+        for prefix in [
+            "\u{feff}",
+            " \u{feff}\t",
+            "\u{feff}\n",
+            "\u{a0}\u{feff}\u{2028}",
+            "\u{2007}\u{feff}\u{3000}",
+        ] {
+            for command in ["/clear", "/resume other", "/compact", "/fork", "/plan"] {
+                for origin in [
+                    SubmissionOrigin::Local(1),
+                    SubmissionOrigin::Remote("request".into()),
+                ] {
+                    let mut p = initialized();
+                    let effects = p.submit(origin, format!("{prefix}{command}"));
+                    assert!(effects.iter().all(|e| !matches!(e, Effect::Write(_))));
+                    assert!(
+                        matches!(&effects[0], Effect::Result(_, SubmissionOutcome::Rejected { code }) if code == "invalid_text")
+                    );
+                    assert_eq!(p.state, OwnerState::AwaitingSessionConfirmation);
+                }
+            }
+        }
+        let mut p = initialized();
+        let text = "\u{feff}ordinary text\n /not-a-leading-command";
+        assert_eq!(
+            write(p.submit(SubmissionOrigin::Local(1), text.into()))["message"]["content"],
+            text
+        );
     }
     #[test]
     fn bootstrap_is_local_once_and_acceptance_requires_full_replay_not_completion() {
