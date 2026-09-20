@@ -1,8 +1,67 @@
 # Integrated Codex delivery qualification
 
-Codex **remains unqualified**. Server and recipient exact-delivery capabilities
-remain absent. This evidence does not close Desktop M2 SC0 or authorize enabling
-Send. Ordinary PTY agents are unsupported; there is no PTY prompt fallback.
+This source enables the version-1 exact-prompt capability for the owned Codex
+0.154.0 launch on macOS and Linux. Server support is separate from recipient
+readiness: a recipient appears only after authenticated initialization and fixed
+thread creation; it is ready only while idle with admission capacity. Ordinary
+PTY agents are unsupported; there is no PTY prompt fallback.
+
+The latest completed actual platform evidence is the **predecessor revision
+`5609f4604d36af16eb4e41e360292e29759f9d0b`**. The capability activation revision
+still requires independent review, final native/npm live public-API smoke, and
+both actual platform jobs on its own exact commit. These remaining gates keep
+Codex task closure pending. Desktop M2 SC0 additionally requires subsequent
+Claude implementation and proof.
+
+## Qualification boundary and actual predecessor evidence
+
+[Run 35481702996](https://github.com/bfirestone/herdr/actions/runs/35481702996)
+passed on the exact predecessor above with Rust 1.98.1:
+
+- [Ubuntu job 106000576264](https://github.com/bfirestone/herdr/actions/runs/35481702996/job/106000576264):
+  Ubuntu 24.04 x86_64; 3,855 Rust tests, six existing skips, auxiliary and documentation gates passed.
+  Both native/npm candidates passed null/private-pipe/PTY, hook and MCP descriptor
+  isolation, safe placement and actual provider alias checks. The nonroot child
+  reported stacked enforce mode, zero effective/permitted capabilities, NNP and
+  seccomp; writes/network were denied with successful parent controls. Verify,
+  no-drift preview, and exact profile/path/restriction/provider restoration passed.
+  Original baseline RTM_NEWADDR/EPERM failures remain separately recorded.
+- [macOS job 106000576046](https://github.com/bfirestone/herdr/actions/runs/35481702996/job/106000576046):
+  macOS arm64; 3,633 Rust tests, six existing skips, auxiliary/docs gates and both native/npm
+  descriptor checks passed. One HTTP handoff test was slow.
+
+The source platform gate selects the macOS/Linux transport implementations.
+Actual CI exercised only the architectures listed above; other architectures
+and native Linux graphical fidelity are not established by these runs.
+
+These CI descriptor checks use empty provider homes and no account or model
+sampling. The macOS model, fixed-thread acknowledgment and actual manual Allow/
+Deny evidence is separately recorded below. Its stricter manual-review launcher
+is a disposable-test exception, never production policy.
+
+The Ubuntu runner's final cleanup killed four `herdr` and four `sh` processes
+from unknown tests. No CPU, ancestry or provenance samples identify the cause.
+Follow-up `herdr-0gdv.01btdj` tracks that suite-level lifetime gap. Individual
+candidate cleanup PASS does not prove the entire suite had no surviving processes.
+
+| Recipient / environment | Compatibility boundary |
+| --- | --- |
+| Owned integrated Codex 0.154.0, verified macOS/Linux transport | Source gate enabled; new activation commit awaits final exact-revision qualification |
+| Same owner during active turn, pending consent or unknown outcome | Identity retained, `ready: false`; admission refused |
+| Starting/unbound, exited, reset, or revoked owner | No recipient capability; token cannot revive or rebind |
+| Other Codex versions | Initialization fails closed |
+| Claude Code | Unsupported; integrated launch rejected pending its own implementation/proof |
+| Windows or other platforms | No server capability |
+| Shell-launched/detected or restored session without a live owner | No recipient capability, regardless of Codex/Claude-looking metadata |
+
+The public offline acceptance drives an isolated server, helper, owner and real
+provider pipes with a scripted provider. It checks ping/list/get/snapshot identity,
+handshake barriers, zero prompt writes on rejection, exact 65,536-byte UTF-8
+admission, correlated provider acceptance, busy/consent readiness, reset and
+replacement. Owner tests cover unknown outcome, identity mismatch, unbound state
+and admission-budget exhaustion. The opt-in live smoke now also verifies public
+ping/list/get/snapshot fields against its actual launch and consent transitions.
+Scripted acceptance is not a replacement for that final provider smoke.
 
 ## Supported candidate and source identity
 
@@ -100,8 +159,8 @@ hook and MCP checks. Both recorded owned cleanup PASS and a matching stopped
 hook without model output. The fixtures create an empty owned `CODEX_HOME`,
 remove OpenAI authentication environment and Codex key/token variables, preserve
 OS HOME, and require `account/read` to return no account. Both passed in this
-unauthenticated configuration. Linux remains unverified until the dedicated
-workflow runs successfully.
+unauthenticated configuration. The later actual predecessor CI result above
+adds Linux evidence; this early local run alone did not qualify Linux.
 
 An attempted supplementary source-library test command,
 `cargo test --locked -p codex-hooks -p codex-rmcp-client -p codex-utils-pty --lib`,
@@ -154,7 +213,8 @@ approval card for each exact owned operation, Deny prevented its scratch write,
 and Allow produced only the expected file content. Fixed thread, matching
 acknowledgment, harmless response and owned cleanup all passed. No prompt used
 PTY input. Normal-policy no-card observations above remain separate evidence.
-The aggregate qualification stays UNVERIFIED pending the platform CI gate.
+These pre-activation live results are retained. The final activation revision
+still needs the extended smoke and both exact-commit CI jobs described above.
 
 Example (supply the exact previously validated executables; never auto-install):
 
@@ -189,15 +249,16 @@ secrets and never runs the live model/permission smoke on pull requests.
 A workflow definition alone is not Linux or macOS run evidence. Record its exact
 run revision and results before closing the platform gate.
 
-Local validation on the candidate change: `RUSTUP_TOOLCHAIN=1.98.1 just ci`
+Historical local validation before runtime and capability activation: `RUSTUP_TOOLCHAIN=1.98.1 just ci`
 passed (3,511 nextest tests, six skipped, plus repository maintenance and asset
 checks). `just docs-contract-test` passed all seven tests. Test fixture commits
 used a process-only `commit.gpgsign=false` override; saved Git settings were
 unchanged. An earlier restricted-host run failed process-observation and host-key
 fixtures; the complete run with normal host access passed. No unrelated failure
-was silently waived. The workflow still needs actual macOS/Linux run evidence.
+was silently waived. That historical run did not supply actual macOS/Linux CI evidence; the
+predecessor platform results above now do.
 
-## Bounded Ubuntu runtime experiment (not qualification)
+## Bounded Ubuntu runtime experiment history
 
 The diagnostic baseline at `e6744b00428fe51be83b886317e794afc29f4984`,
 [run 35417557753](https://github.com/bfirestone/herdr/actions/runs/35417557753),
@@ -398,8 +459,9 @@ its actual child mode was not observed. Alias metadata failures now report
 0700 and captured identity requirements. This observation creates no aliases
 and makes no extra RPC, read, wait or retry. Public
 `candidate_paths` contains only safe-parent, outside-temp and alias booleans.
-Actual Ubuntu parent metadata and successful native/npm aliases and PTY execution
-still require the next exact-commit CI run.
+The later predecessor run recorded above established actual Ubuntu parent
+metadata, both native/npm aliases and PTY execution. Earlier source attempts
+remain preserved as historical failures.
 
 The final workflow step always attempts exact owned rollback after an attempted
 apply. Before any candidate provider starts, a fresh fixed runner-owned status
@@ -430,9 +492,9 @@ hierarchical/opaque inventory, bounded nonblocking epoch reads, hash-policy and
 owned-hash requirements, failed compound-add ownership refusal, epoch drift,
 per-removal durable checkpoints, tamper, unknown ownership, redaction, child
 observations and denial controls. They run through the existing Rust integration
-gate. They are **not host-kernel or live CI enforcement evidence**. This candidate
-still needs one independently reviewed, published exact-commit branch run showing
-separate baseline/candidate results, both complete fixture passes, unchanged
-restrictions, second preview with no drift and restored cleanup. No Linux
-qualification, Desktop M2/T3 closure, or exact Send activation follows from these
-local tests or the workflow definition.
+gate. They are **not host-kernel or live CI enforcement evidence**. The predecessor
+run above subsequently passed separate baseline/candidate recording, both complete
+fixture checks, unchanged restrictions, no-drift preview and restored cleanup.
+The activation revision still requires its own final live public capability smoke
+and exact macOS/Linux jobs; local tests and workflow definitions alone do not
+close Desktop M2/T3.

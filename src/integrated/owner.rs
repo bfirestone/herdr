@@ -42,8 +42,14 @@ struct Pending {
 }
 struct State {
     phase: OwnerState,
+    initialized: bool,
     seen: HashSet<String>,
     pending: Option<Pending>,
+}
+
+pub(crate) struct CodexSnapshot {
+    pub phase: OwnerState,
+    pub exact_prompt: Option<crate::api::schema::ExactPromptRecipient>,
 }
 
 /// Owns exactly one accepted stream. OnceLock has no replacement/rebind path.
@@ -55,7 +61,7 @@ pub(crate) struct Owner {
     observed: std::sync::Condvar,
 }
 impl Owner {
-    pub(crate) fn launch(
+    pub(crate) fn launch_codex(
         identity: RecipientIdentity,
         bootstrap: RecipientBootstrap,
         pid: u32,
@@ -67,6 +73,7 @@ impl Owner {
             observed: std::sync::Condvar::new(),
             state: Mutex::new(State {
                 phase: OwnerState::Starting,
+                initialized: false,
                 seen: HashSet::new(),
                 pending: None,
             }),
@@ -109,6 +116,41 @@ impl Owner {
 
     pub(crate) fn state(&self) -> OwnerState {
         self.state.lock().unwrap().phase
+    }
+
+    /// Only `launch_codex` creates production owners. A future provider must
+    /// establish its own qualification instead of inheriting detected metadata.
+    /// The snapshot is advisory; reserve rechecks admission atomically.
+    pub(crate) fn codex_snapshot(
+        &self,
+        terminal_id: &str,
+        server_instance: Option<&str>,
+    ) -> CodexSnapshot {
+        let Ok(state) = self.state.lock() else {
+            return CodexSnapshot {
+                phase: OwnerState::Revoked,
+                exact_prompt: None,
+            };
+        };
+        let bound = self.stream.get().is_some();
+        let eligible = crate::platform::codex_exact_prompt_qualified()
+            && self.identity.terminal_id == terminal_id
+            && Some(self.identity.server_instance.as_str()) == server_instance
+            && state.initialized
+            && bound
+            && !matches!(state.phase, OwnerState::Starting | OwnerState::Revoked);
+        CodexSnapshot {
+            phase: state.phase,
+            exact_prompt: eligible.then(|| crate::api::schema::ExactPromptRecipient {
+                version: super::EXACT_PROMPT_VERSION,
+                recipient_token: self.identity.recipient_token.clone(),
+                server_instance: self.identity.server_instance.clone(),
+                transport: super::EXACT_PROMPT_TRANSPORT.into(),
+                ready: state.phase == OwnerState::Idle
+                    && state.pending.is_none()
+                    && state.seen.len() < 4096,
+            }),
+        }
     }
 
     /// Admission is synchronous and bounded; only the admitted request gets a waiter.
@@ -200,6 +242,7 @@ impl Owner {
                 {
                     return Err(invalid());
                 }
+                state.initialized |= phase == OwnerState::Idle;
                 state.phase = phase;
             }
             Some("result") => {
@@ -289,6 +332,7 @@ impl Owner {
             observed: std::sync::Condvar::new(),
             state: Mutex::new(State {
                 phase: OwnerState::Starting,
+                initialized: false,
                 seen: HashSet::new(),
                 pending: None,
             }),
@@ -324,11 +368,75 @@ mod tests {
             observed: std::sync::Condvar::new(),
             state: Mutex::new(State {
                 phase: OwnerState::Idle,
+                initialized: true,
                 seen: HashSet::new(),
                 pending: None,
             }),
         };
         Some((owner, peer))
+    }
+    #[test]
+    fn codex_snapshot_requires_bound_initialized_matching_owner_and_admission_budget() {
+        let Some((owner, _peer)) = connected() else {
+            return;
+        };
+        let snapshot = || owner.codex_snapshot("t", Some("s")).exact_prompt;
+        let initial = snapshot().unwrap();
+        assert!(initial.ready);
+        assert!(owner
+            .codex_snapshot("wrong", Some("s"))
+            .exact_prompt
+            .is_none());
+        assert!(owner
+            .codex_snapshot("t", Some("wrong"))
+            .exact_prompt
+            .is_none());
+        assert!(owner.codex_snapshot("t", None).exact_prompt.is_none());
+        for phase in [
+            OwnerState::ActiveTurn,
+            OwnerState::PendingPermission,
+            OwnerState::OutcomeUnknown,
+        ] {
+            owner.state.lock().unwrap().phase = phase;
+            let capability = snapshot().unwrap();
+            assert!(!capability.ready);
+            assert_eq!(capability.recipient_token, initial.recipient_token);
+            assert_eq!(capability.server_instance, initial.server_instance);
+            assert!(owner.reserve(&owner.identity, "unready", "text").is_err());
+        }
+        {
+            let mut state = owner.state.lock().unwrap();
+            state.phase = OwnerState::Idle;
+            state.initialized = false;
+        }
+        assert!(snapshot().is_none());
+        owner.state.lock().unwrap().initialized = true;
+        let pending = owner.reserve(&owner.identity, "pending", "text").unwrap();
+        // Even a phase observation racing a pending reservation cannot say ready.
+        owner.state.lock().unwrap().phase = OwnerState::Idle;
+        assert!(!snapshot().unwrap().ready);
+        {
+            let mut state = owner.state.lock().unwrap();
+            state.pending.take();
+            state.seen = (0..4096).map(|i| i.to_string()).collect();
+        }
+        drop(pending);
+        assert!(!snapshot().unwrap().ready);
+        assert_eq!(
+            owner
+                .reserve(&owner.identity, "exhausted", "text")
+                .unwrap_err(),
+            SubmissionOutcome::rejected("queue_full")
+        );
+        owner.revoke();
+        assert!(snapshot().is_none());
+        let unbound = Owner::test_starting(owner.identity.clone());
+        unbound.state.lock().unwrap().phase = OwnerState::Idle;
+        unbound.state.lock().unwrap().initialized = true;
+        assert!(unbound
+            .codex_snapshot("t", Some("s"))
+            .exact_prompt
+            .is_none());
     }
     #[test]
     fn actual_partial_owner_write_disconnect_never_rebinds_or_delivers_to_replacement() {

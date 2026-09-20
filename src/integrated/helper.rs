@@ -371,7 +371,7 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
             bootstrap.nonce.clone(),
             directory.to_string_lossy().into_owned(),
         ];
-        let owner = Owner::launch(
+        let owner = Owner::launch_codex(
             RecipientIdentity {
                 server_instance: "test-server".into(),
                 recipient_token: "replacement-recipient".into(),
@@ -441,7 +441,7 @@ if mode in ["wrong", "reset", "overflow"]: sys.stdin.read()
             bootstrap.nonce.clone(),
             directory.to_string_lossy().into_owned(),
         ];
-        let owner = Owner::launch(
+        let owner = Owner::launch_codex(
             RecipientIdentity {
                 server_instance: "test-server".into(),
                 recipient_token: "test-recipient".into(),

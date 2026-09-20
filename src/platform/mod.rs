@@ -3,6 +3,16 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+// Qualified Codex 0.154.0 owned pipe/bootstrap transport only. This source gate
+// has no runtime override; see docs/next/integrated-agent-verification.md.
+pub(crate) fn codex_exact_prompt_qualified() -> bool {
+    codex_exact_prompt_platform(std::env::consts::OS)
+}
+
+fn codex_exact_prompt_platform(os: &str) -> bool {
+    matches!(os, "macos" | "linux")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,
@@ -526,6 +536,19 @@ fn child_exit_classification_only_checkpoints_interruptions() {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn codex_qualification_is_limited_to_verified_platforms() {
+        for os in ["macos", "linux"] {
+            assert!(super::codex_exact_prompt_platform(os));
+        }
+        for os in ["windows", "freebsd", "openbsd", "unknown", ""] {
+            assert!(!super::codex_exact_prompt_platform(os));
+        }
+        assert_eq!(
+            super::codex_exact_prompt_qualified(),
+            cfg!(any(target_os = "macos", target_os = "linux"))
+        );
+    }
     use super::*;
 
     #[test]

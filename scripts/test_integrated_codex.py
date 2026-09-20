@@ -233,6 +233,31 @@ class Session:
         self.identity = {key: started[key] for key in ('server_instance', 'recipient_token')}
         self.identity['terminal_id'] = started['agent']['terminal_id']
         eventually(lambda: self.status() == 'idle', 'provider_startup_unverified')
+        self.verify_capabilities(ready=True)
+
+    def verify_capabilities(self, ready):
+        """Check public advertisement against this launch, without exposing tokens."""
+        def field(value, key):
+            return value.get(key) if isinstance(value, dict) else None
+        advertised = field(field(self.result('ping'), 'capabilities'), 'agent_prompt_exact')
+        expected = {'version': 1, 'max_text_bytes': 65536, 'guarantee': 'recipient_instance_v1'}
+        if (advertised != expected or type(advertised.get('version')) is not int
+                or type(advertised.get('max_text_bytes')) is not int):
+            raise ProofFailure('public_server_capability_unverified')
+        expected = {key: self.identity[key] for key in ('recipient_token', 'server_instance')}
+        expected.update(version=1, transport='recipient_channel_v1', ready=ready)
+        info = field(self.result('agent.get', {'target': self.pane}), 'agent')
+        listed = field(self.result('agent.list'), 'agents')
+        snapshot = field(field(self.result('session.snapshot'), 'snapshot'), 'agents')
+        for agents in ([info], listed, snapshot):
+            if not isinstance(agents, list):
+                raise ProofFailure('public_recipient_capability_unverified')
+            matches = [agent for agent in agents if isinstance(agent, dict)
+                       and agent.get('terminal_id') == self.identity['terminal_id']]
+            capability = matches[0].get('exact_prompt') if len(matches) == 1 else None
+            if (capability != expected or type(capability.get('version')) is not int
+                    or type(capability.get('ready')) is not bool):
+                raise ProofFailure('public_recipient_capability_unverified')
 
     def status(self):
         return self.result('agent.get', {'target': self.pane})['agent']['agent_status']
@@ -283,6 +308,7 @@ class Session:
         eventually(requested_or_completed, 'permission_request_timeout', timeout=90)
         if self.status() != 'blocked':
             raise ProofFailure('permission_not_requested_' + decision + ('_scratch_present' if path.exists() else '_scratch_absent'))
+        self.verify_capabilities(ready=False)
         # Wait for the renderer to publish the full matching card. Never authorize
         # an operation inferred from model prose or a partial/truncated card.
         def visible():
@@ -302,6 +328,7 @@ class Session:
             self.drain_client()
             return self.status() == 'idle'
         eventually(completed, 'permission_completion_unverified_' + decision, timeout=90)
+        self.verify_capabilities(ready=True)
         if decision == 'allow':
             if not path.is_file() or path.read_bytes() != b'herdr-codex-proof':
                 raise ProofFailure('allowed_scratch_effect_unverified')
@@ -356,11 +383,13 @@ def live(args):
               'platform': os.uname().sysname, 'qualification': 'UNVERIFIED', 'live_smoke': 'UNVERIFIED',
               'strict_test_policy': args.strict_test_policy,
               'fixed_thread': 'UNVERIFIED', 'matching_ack': 'UNVERIFIED',
+              'public_capabilities': 'UNVERIFIED',
               'permission_allow_deny': 'UNVERIFIED', 'child_fd_isolation': 'UNVERIFIED',
               'queued_reset_replacement': 'UNVERIFIED'}
     session = Session(binary, args.session, args.scratch, provider, args.consent_scratch, args.strict_test_policy)
     try:
         session.start()
+        report['public_capabilities'] = 'PASS'
         preview = session.preview()
         thread = re.search(r'fixed thread ([0-9a-f-]{36})', preview)
         if not thread:
@@ -383,6 +412,7 @@ def live(args):
         session.submit('Reply with exactly HERDR_CODEX_PROOF_OK. Do not run tools or change files.')
         report['matching_ack'] = 'PASS'
         eventually(lambda: session.status() == 'idle', 'harmless_turn_completion_unverified', timeout=90)
+        session.verify_capabilities(ready=True)
         if 'HERDR_CODEX_PROOF_OK' not in session.preview():
             raise ProofFailure('harmless_response_unverified')
         report['harmless_turn'] = 'PASS'
@@ -2166,6 +2196,56 @@ class SafetyTests(unittest.TestCase):
         session.pane = 'p_1_1'
         session.result = lambda method, params: {'type': 'pane_read', 'read': {'text': 'visible'}}
         self.assertEqual(session.preview(), 'visible')
+
+    def test_live_public_capabilities_require_matching_typed_launch_identity(self):
+        import copy
+        session = object.__new__(Session)
+        session.pane = 'pane'
+        session.identity = {'terminal_id': 'terminal', 'server_instance': 'server', 'recipient_token': 'token'}
+        for ready in (True, False):
+            capability = {'version': 1, 'transport': 'recipient_channel_v1', 'ready': ready,
+                          'server_instance': 'server', 'recipient_token': 'token'}
+            agent = {'terminal_id': 'terminal', 'exact_prompt': capability}
+            baseline = {'ping': {'capabilities': {'agent_prompt_exact': {
+                'version': 1, 'max_text_bytes': 65536, 'guarantee': 'recipient_instance_v1'}}},
+                'agent.get': {'agent': agent}, 'agent.list': {'agents': [agent]},
+                'session.snapshot': {'snapshot': {'agents': [agent]}}}
+            session.result = lambda method, params=None: baseline[method]
+            session.verify_capabilities(ready)
+            for method in baseline:
+                for malformed in (None, [], 'private-token', {}):
+                    responses = copy.deepcopy(baseline)
+                    responses[method] = malformed
+                    session.result = lambda method, params=None: responses[method]
+                    with self.assertRaisesRegex(ProofFailure, '^public_(server|recipient)_capability_unverified$'):
+                        session.verify_capabilities(ready)
+            mutations = [
+                ('ping', ('capabilities',), None),
+                ('ping', ('capabilities', 'agent_prompt_exact', 'version'), True),
+                ('ping', ('capabilities', 'agent_prompt_exact', 'max_text_bytes'), 65537),
+                ('session.snapshot', ('snapshot',), None),
+                ('agent.list', ('agents',), [agent, agent]),
+            ]
+            for method, path, value in mutations:
+                responses = copy.deepcopy(baseline)
+                target = responses[method]
+                for key in path[:-1]: target = target[key]
+                target[path[-1]] = value
+                session.result = lambda method, params=None: responses[method]
+                with self.assertRaises(ProofFailure): session.verify_capabilities(ready)
+            for method in ('agent.get', 'agent.list', 'session.snapshot'):
+                for key, invalid in [('terminal_id', 'stale'), ('version', True), ('ready', int(ready)),
+                                     ('ready', not ready), ('recipient_token', 'stale'),
+                                     ('server_instance', 'stale'), ('transport', 'pty')]:
+                    responses = copy.deepcopy(baseline)
+                    response = responses[method]
+                    target = (response['agent'] if method == 'agent.get' else
+                              response['agents'][0] if method == 'agent.list' else response['snapshot']['agents'][0])
+                    if key == 'terminal_id': target[key] = invalid
+                    else: target['exact_prompt'][key] = invalid
+                    session.result = lambda method, params=None: responses[method]
+                    with self.assertRaisesRegex(ProofFailure, '^public_recipient_capability_unverified$'):
+                        session.verify_capabilities(ready)
 
     def test_consent_requires_exact_visible_command_and_current_turn(self):
         command = "printf herdr-codex-proof > /private/tmp/owned/allow.txt"

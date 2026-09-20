@@ -1,4 +1,10 @@
 //! Owned integrated sessions; never route an exact prompt through a pane PTY.
+pub(crate) const CODEX_VERSION: &str = "0.154.0";
+pub(crate) const EXACT_PROMPT_VERSION: u32 = 1;
+pub(crate) const EXACT_PROMPT_MAX_TEXT_BYTES: u32 = 65536;
+pub(crate) const EXACT_PROMPT_GUARANTEE: &str = "recipient_instance_v1";
+pub(crate) const EXACT_PROMPT_TRANSPORT: &str = "recipient_channel_v1";
+
 mod approvals;
 mod channel;
 mod codex;

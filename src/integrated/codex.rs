@@ -240,7 +240,7 @@ impl Codex {
                             .next()
                             .and_then(|prefix| prefix.rsplit_once('/'))
                             .map(|(_, version)| version)
-                            != Some("0.154.0")
+                            != Some(super::CODEX_VERSION)
                     })
                 {
                     return Err(());
@@ -271,7 +271,7 @@ impl Codex {
                 self.thread = Some(thread.into());
                 self.stage = 2;
                 self.state = OwnerState::Idle;
-                Ok(vec![Effect::Text(format!("Codex integrated — fixed thread {thread}\nApproval policy: {}\nSandbox: {}\nExact delivery remains unqualified pending provider proof.\n", result["approvalPolicy"], result["sandbox"])),Effect::State(self.state)])
+                Ok(vec![Effect::Text(format!("Codex integrated — fixed thread {thread}\nApproval policy: {}\nSandbox: {}\nExact delivery is available for this fixed recipient when idle.\n", result["approvalPolicy"], result["sandbox"])),Effect::State(self.state)])
             }
             _ => {
                 let pending = self.pending.as_ref().ok_or(())?;

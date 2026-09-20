@@ -376,8 +376,16 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let integrated_snapshot = integrated.map(|owner| {
+            owner.codex_snapshot(
+                terminal.id.as_str(),
+                self.integrated_server_instance.as_deref(),
+            )
+        });
         Some(crate::api::schema::AgentInfo {
-            exact_prompt: None,
+            exact_prompt: integrated_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.exact_prompt.clone()),
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
             agent: integrated.map(|_| "codex".to_owned()).or(pane.agent),
@@ -385,8 +393,8 @@ impl App {
             terminal_title: pane.terminal_title,
             terminal_title_stripped: pane.terminal_title_stripped,
             display_agent: pane.display_agent,
-            agent_status: integrated
-                .map(|owner| match owner.state() {
+            agent_status: integrated_snapshot
+                .map(|snapshot| match snapshot.phase {
                     crate::integrated::OwnerState::Idle => crate::api::schema::AgentStatus::Idle,
                     crate::integrated::OwnerState::ActiveTurn => {
                         crate::api::schema::AgentStatus::Working
@@ -497,7 +505,7 @@ impl App {
             recipient_token: token,
             terminal_id: terminal_id.to_string(),
         };
-        let owner = crate::integrated::Owner::launch(identity.clone(), bootstrap, pid);
+        let owner = crate::integrated::Owner::launch_codex(identity.clone(), bootstrap, pid);
         runtime.bind_integrated_owner(owner.lease());
         self.integrated_owners
             .insert(identity.terminal_id.clone(), owner);

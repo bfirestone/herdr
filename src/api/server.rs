@@ -66,7 +66,13 @@ pub(crate) fn start_server_with_stop_control(
 
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
-        agent_prompt_exact: None,
+        agent_prompt_exact: crate::platform::codex_exact_prompt_qualified().then(|| {
+            crate::api::schema::ExactPromptCapability {
+                version: crate::integrated::EXACT_PROMPT_VERSION,
+                max_text_bytes: crate::integrated::EXACT_PROMPT_MAX_TEXT_BYTES,
+                guarantee: crate::integrated::EXACT_PROMPT_GUARANTEE.into(),
+            }
+        }),
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
