@@ -6,12 +6,27 @@ pub mod support;
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::{fs::PermissionsExt, net::UnixStream};
-use std::path::PathBuf;
+use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt, net::UnixStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 type ProcessBirth = (u32, (u64, u64));
+
+fn fixture_directory(parent: &Path, template: &str) -> PathBuf {
+    let mut path = std::ffi::CString::new(parent.join(template).into_os_string().into_vec())
+        .unwrap()
+        .into_bytes_with_nul();
+    // mkdtemp exclusively creates a private 0700 directory, replacing exactly
+    // the template's trailing six X bytes in this writable NUL-terminated buffer.
+    assert!(
+        !unsafe { libc::mkdtemp(path.as_mut_ptr().cast()) }.is_null(),
+        "fixture directory: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(path.pop(), Some(0));
+    PathBuf::from(std::ffi::OsString::from_vec(path))
+}
 
 /// Every server has a fresh catalog and runtime. The provider below has no
 /// credentials and no subprocesses; its control socket EOF ends it on panic.
@@ -24,15 +39,16 @@ struct ApiFixture {
 
 impl ApiFixture {
     fn new() -> Self {
-        let base = std::env::temp_dir().join(format!(
-            "c-{:x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&base).unwrap();
-        let config = base.as_path().join("config");
+        Self::new_in(&std::env::temp_dir())
+    }
+
+    fn new_in(temp_root: &Path) -> Self {
+        // Keep the lexical catalog path compact: /var/folders TMPDIR is already
+        // 48 bytes on macOS CI, and the client socket suffix is longer than API.
+        let config = fixture_directory(temp_root, "c-XXXXXX");
+        // Trusted provider cwd must be canonical, independently of socket names
+        // (macOS /var can resolve through the longer /private/var spelling).
+        let base = config.canonicalize().unwrap();
         let runtime = base.as_path().join("runtime");
         for dir in [
             config.join("herdr-dev"),
@@ -56,7 +72,7 @@ impl ApiFixture {
             .env("HOME", base.as_path())
             .env("XDG_CONFIG_HOME", config)
             .env("XDG_RUNTIME_DIR", &runtime)
-            .env("TMPDIR", std::env::temp_dir())
+            .env("TMPDIR", temp_root)
             .env("HERDR_SOCKET_PATH", &socket)
             .env("HERDR_CLIENT_SOCKET_PATH", runtime.join("client.sock"))
             .env("SHELL", "/bin/sh")
@@ -493,6 +509,42 @@ impl Drop for ApiFixture {
             std::fs::remove_dir_all(&self.base).unwrap();
         }
     }
+}
+
+#[test]
+fn public_codex_capability_survives_macos_length_tmpdir() {
+    let parent = std::env::temp_dir();
+    let padding = 48usize.saturating_sub(parent.as_os_str().len() + 7);
+    let long_root = fixture_directory(&parent, &format!("{}XXXXXX", "l".repeat(padding)));
+    assert!(long_root.as_os_str().len() >= 48);
+    let fixture = ApiFixture::new_in(&long_root);
+    let client_socket = fixture.socket.with_file_name("herdr-client.sock");
+    for socket in [&fixture.socket, &client_socket] {
+        assert!(
+            socket.as_os_str().len() < 104,
+            "macOS socket capacity: {} bytes",
+            socket.as_os_str().len()
+        );
+        support::wait_for_socket(socket, Duration::from_secs(10));
+        drop(UnixStream::connect(socket).unwrap());
+    }
+    assert_eq!(fixture.base.canonicalize().unwrap(), fixture.base);
+    assert_eq!(
+        std::fs::metadata(&fixture.base)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let workspace = fixture.workspace();
+    let (started, mut provider) = fixture.launch(&workspace);
+    provider.initialize(&json!(fixture.base));
+    let capability = fixture.wait_ready(&started, true);
+    fixture.assert_projection(&started, &capability);
+    drop(provider);
+    drop(fixture);
+    std::fs::remove_dir(long_root).unwrap();
 }
 
 #[test]
