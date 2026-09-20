@@ -122,16 +122,20 @@ impl ApiFixture {
     }
 
     fn launch(&self, workspace: &Value) -> (Value, ProviderFixture) {
+        self.launch_provider(workspace, "codex")
+    }
+
+    fn launch_provider(&self, workspace: &Value, provider_name: &str) -> (Value, ProviderFixture) {
         let path = self.base.join("control.sock");
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let script = self.base.join("codex");
+        let script = self.base.join(provider_name);
         std::fs::write(&script, SCRIPTED_CODEX).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let started = self.request(
             "agent.start_integrated",
-            json!({"provider":"codex",
+            json!({"provider":provider_name,
             "workspace_id":workspace["workspace"]["workspace_id"],"cwd":self.base}),
         );
         assert!(started.get("error").is_none(), "{started}");
@@ -167,7 +171,13 @@ impl ApiFixture {
                 .processes
                 .push((pid, support::test_process_birth(pid).unwrap().unwrap()));
         }
-        assert_eq!(provider.event()["method"], "initialize");
+        let initial = provider.event();
+        if provider_name == "codex" {
+            assert_eq!(initial["method"], "initialize");
+        } else {
+            assert_eq!(initial["type"], "control_request");
+            assert_eq!(initial["request"]["subtype"], "initialize");
+        }
         (started["result"].clone(), provider)
     }
 
@@ -301,7 +311,7 @@ fn public_codex_capability_tracks_handshake_admission_and_replacement() {
     assert_eq!(
         fixture.request(
             "agent.start_integrated",
-            json!({"provider":"claude",
+            json!({"provider":"unsupported-provider",
         "workspace_id":workspace["workspace"]["workspace_id"],"cwd":fixture.base})
         )["error"]["code"],
         "integrated_start_failed"
@@ -626,4 +636,25 @@ fn codex_ci_covers_both_bootstrap_platforms_without_live_authentication() {
         !workflow.contains("secrets."),
         "provider fixture CI must not require authentication secrets"
     );
+}
+
+#[test]
+fn unqualified_claude_launch_never_advertises_or_accepts_exact_prompts() {
+    let fixture = ApiFixture::new();
+    let workspace = fixture.workspace();
+    let (started, mut provider) = fixture.launch_provider(&workspace, "claude");
+    assert_eq!(fixture.agent(&started)["agent"], "claude");
+    fixture.assert_projection(&started, &Value::Null);
+    provider.send(json!({"type":"control_response","response":{"subtype":"success","request_id":"initialize","pending_permission_requests":[],"pending_user_dialog_requests":[],"response":{"commands":[],"agents":[],"models":[],"output_style":"default"}}}));
+    assert_eq!(provider.event()["request"]["subtype"], "get_binary_version");
+    provider.send(json!({"type":"control_response","response":{"subtype":"success","request_id":"version","response":{"version":"2.1.276"}}}));
+    let reply = fixture.request(
+        "agent.prompt_exact",
+        exact_params(&started, "must not reach unqualified provider"),
+    );
+    assert_eq!(reply["result"]["outcome"], "rejected", "{reply}");
+    assert_eq!(reply["result"]["code"], "unsupported_recipient", "{reply}");
+    fixture.assert_projection(&started, &Value::Null);
+    provider.send(json!({"fixture":"barrier"}));
+    assert_eq!(provider.event(), json!({"barrier":true}));
 }

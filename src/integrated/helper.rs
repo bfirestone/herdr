@@ -13,23 +13,110 @@ use std::{
     time::{Duration, Instant},
 };
 
+enum Protocol {
+    Codex(Codex),
+    Claude(super::claude::Claude),
+}
+impl Protocol {
+    fn state(&self) -> super::OwnerState {
+        match self {
+            Self::Codex(p) => p.state,
+            Self::Claude(p) => p.state,
+        }
+    }
+    fn initialize(&self) -> serde_json::Value {
+        match self {
+            Self::Codex(_) => Codex::initialize(),
+            Self::Claude(_) => super::claude::Claude::initialize(),
+        }
+    }
+    fn submit(&mut self, origin: SubmissionOrigin, text: String) -> Vec<Effect> {
+        match self {
+            Self::Codex(p) => p.submit(origin, text),
+            Self::Claude(p) => p.submit(origin, text),
+        }
+    }
+    fn event(&mut self, frame: serde_json::Value) -> Result<Vec<Effect>, ()> {
+        match self {
+            Self::Codex(p) => p.event(frame),
+            Self::Claude(p) => p.event(frame),
+        }
+    }
+    fn decision(&mut self, id: &serde_json::Value, decision: &str) -> Vec<Effect> {
+        match self {
+            Self::Codex(p) => p.decision(id, decision),
+            Self::Claude(p) => p.decision(id, decision),
+        }
+    }
+    fn cards(&self) -> Vec<super::approvals::Card> {
+        match self {
+            Self::Codex(p) => p.approvals.cards(),
+            Self::Claude(p) => p.cards(),
+        }
+    }
+    fn name(&self) -> &str {
+        match self {
+            Self::Codex(_) => "Codex",
+            Self::Claude(_) => "Claude",
+        }
+    }
+}
+
 pub(crate) fn run(args: &[String]) -> io::Result<()> {
-    let mut command = Command::new("codex");
-    command.args(["app-server", "--listen", "stdio://"]);
-    run_provider(
-        args,
+    let [path, nonce, cwd, provider] = args else {
+        return Err(io::ErrorKind::InvalidInput.into());
+    };
+    let provider = super::ProviderKind::parse(provider).ok_or(io::ErrorKind::InvalidInput)?;
+    let (command, protocol) = match provider {
+        super::ProviderKind::Codex => {
+            let mut command = Command::new("codex");
+            command.args(["app-server", "--listen", "stdio://"]);
+            (command, Protocol::Codex(Codex::new(cwd.clone())))
+        }
+        super::ProviderKind::Claude => {
+            let session = super::claude::fresh_uuid()?;
+            (
+                super::claude::Claude::command(&session),
+                Protocol::Claude(super::claude::Claude::new(cwd.clone(), session)),
+            )
+        }
+    };
+    run_protocol(
+        &[path.clone(), nonce.clone(), cwd.clone()],
         command,
+        protocol,
         true,
+        #[cfg(test)]
+        None,
         #[cfg(test)]
         None,
     )
 }
 
+#[cfg(test)]
 fn run_provider(
     args: &[String],
+    command: Command,
+    render_enabled: bool,
+    cleanup_gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+) -> io::Result<()> {
+    run_protocol(
+        args,
+        command,
+        Protocol::Codex(Codex::new(args[2].clone())),
+        render_enabled,
+        cleanup_gate,
+        None,
+    )
+}
+
+fn run_protocol(
+    args: &[String],
     mut command: Command,
+    mut protocol: Protocol,
     render_enabled: bool,
     #[cfg(test)] cleanup_gate: Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>,
+    #[cfg(test)] test_ui: Option<mpsc::Receiver<Input>>,
 ) -> io::Result<()> {
     let [path, nonce, cwd] = args else {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -101,8 +188,9 @@ fn run_provider(
         if render_enabled {
             render::start(view.clone(), ui_tx.clone());
         }
-        let mut codex = Codex::new(cwd.clone());
-        write_frame(&mut input, &Codex::initialize(), INPUT_LIMIT)?;
+        #[cfg(test)]
+        let ui_rx = test_ui.unwrap_or(ui_rx);
+        write_frame(&mut input, &protocol.initialize(), INPUT_LIMIT)?;
         let startup = Instant::now();
         let mut pending_since = None;
         let mut local_sequence = 0u64;
@@ -115,7 +203,7 @@ fn run_provider(
                 if crate::platform::recipient_provider_exited(&child)? {
                     return Err(io::ErrorKind::UnexpectedEof.into());
                 }
-                if codex.state == super::owner::OwnerState::Starting
+                if protocol.state() == super::owner::OwnerState::Starting
                     && startup.elapsed() > Duration::from_secs(15)
                     || pending_since
                         .is_some_and(|time: Instant| time.elapsed() > Duration::from_secs(15))
@@ -139,7 +227,7 @@ fn run_provider(
                             .as_str()
                             .ok_or(io::ErrorKind::InvalidData)?
                             .to_owned();
-                        effects.extend(codex.submit(SubmissionOrigin::Remote(id), text));
+                        effects.extend(protocol.submit(SubmissionOrigin::Remote(id), text));
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         return Err(io::ErrorKind::UnexpectedEof.into())
@@ -150,7 +238,7 @@ fn run_provider(
                 for _ in 0..16 {
                     match provider_rx.try_recv() {
                         Ok(frame) => effects.extend(
-                            codex
+                            protocol
                                 .event(frame?)
                                 .map_err(|_| io::ErrorKind::InvalidData)?,
                         ),
@@ -166,18 +254,18 @@ fn run_provider(
                         Input::Text(text) => {
                             local_sequence += 1;
                             effects.extend(
-                                codex.submit(SubmissionOrigin::Local(local_sequence), text),
+                                protocol.submit(SubmissionOrigin::Local(local_sequence), text),
                             );
                         }
                         Input::Decision(id, decision) => {
-                            effects.extend(codex.decision(&id, &decision))
+                            effects.extend(protocol.decision(&id, &decision))
                         }
                     }
                 }
                 for effect in effects.drain(..) {
                     match effect {
                         Effect::Write(frame) => {
-                            if frame["method"] == "turn/start" {
+                            if frame["method"] == "turn/start" || frame["type"] == "user" {
                                 pending_since = Some(Instant::now());
                             }
                             write_frame(&mut input, &frame, INPUT_LIMIT)?;
@@ -204,7 +292,8 @@ fn run_provider(
                         }
                         Effect::Text(text) => view.lock().unwrap().text(&text),
                         Effect::State(state) => {
-                            view.lock().unwrap().status = format!("Codex integrated — {state:?}");
+                            view.lock().unwrap().status =
+                                format!("{} integrated — {state:?}", protocol.name());
                             write_frame(
                                 &mut control,
                                 &json!({"kind":"state","identity":identity,"state":state}),
@@ -213,12 +302,15 @@ fn run_provider(
                         }
                     }
                 }
-                view.lock().unwrap().cards = codex.approvals.cards();
+                view.lock().unwrap().cards = protocol.cards();
                 std::thread::sleep(Duration::from_millis(5));
             }
         })();
         {
             let mut view = view.lock().unwrap();
+            if session.is_err() {
+                view.text("\nProvider protocol failed or unsupported interaction; recipient retired. Pending input may have been delivered. Inspect before resending.\n");
+            }
             view.ended = true;
             view.status = "Recipient revoked; never replay pending input".into();
         }
@@ -611,6 +703,211 @@ while True:
             .unwrap();
         assert!(status.success());
         owner.wait_for_phase(OwnerState::Revoked);
+        assert!(std::fs::read_dir(&directory).unwrap().next().is_none());
+        std::fs::remove_dir(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod claude_tests {
+    use super::*;
+    use crate::integrated::{Owner, OwnerState, ProviderKind, SubmissionOutcome};
+    const SCRIPT: &str = r#"
+import json,sys,os,socket,subprocess,select
+child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])
+observer=socket.create_connection(('127.0.0.1',int(os.environ['HERDR_FIXTURE_OBSERVER'])))
+sync=observer.makefile('rwb',buffering=0)
+def observe(s):sync.write((str(s)+'\n').encode())
+def release():assert sync.readline()==b'continue\n'
+def send(x):print(json.dumps(x),flush=True)
+def read():return json.loads(sys.stdin.readline())
+observe(child.pid)
+a=read();assert a=={'type':'control_request','request_id':'initialize','request':{'subtype':'initialize'}}
+send({'type':'control_response','response':{'subtype':'success','request_id':'initialize','pending_permission_requests':[],'pending_user_dialog_requests':[],'response':{'commands':[],'agents':[],'models':[],'output_style':'default'}}})
+a=read();assert a['request']['subtype']=='get_binary_version'
+send({'type':'control_response','response':{'subtype':'success','request_id':a['request_id'],'response':{'version':'2.1.276'}}})
+a=read();assert a['type']=='user';assert a['session_id']=='fixed-fixture-session';assert a['parent_tool_use_id'] is None
+text=a['message']['content'];assert text=='private-claude-fixture\nexact text'
+assert text not in str(sys.argv) and text not in str(dict(os.environ));assert os.listdir('.')==[]
+observe('first-input')
+release()
+assert not select.select([sys.stdin],[],[],0)[0], 'second bootstrap reached provider'
+mode=os.environ['HERDR_FIXTURE_MODE']
+if mode=='reset':send({'type':'conversation_reset','new_conversation_id':'replacement'})
+elif mode=='reset-after-replay':
+ a['isReplay']=True;send(a);send({'type':'conversation_reset','new_conversation_id':'replacement'})
+elif mode=='wrong':
+ a['isReplay']=True;a['session_id']='replacement';send(a)
+elif mode=='result-first':send({'type':'result','session_id':a['session_id'],'subtype':'success'})
+elif mode=='overflow':
+ try:print('x'*1048577,flush=True)
+ except BrokenPipeError:pass
+elif mode=='stderr':
+ try:sys.stderr.write('x'*65537);sys.stderr.flush()
+ except BrokenPipeError:pass
+else:
+ a['isReplay']=True;send(a)
+ send({'type':'control_request','request_id':'consent','request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'tool-1','input':{'command':'printf safe','timeout':2000}}})
+ consent_id='consent'
+ if mode=='cancel':
+  observe('cancel-ready');release()
+  send({'type':'control_cancel_request','request_id':'consent'})
+  observe('cancelled');release()
+  assert not select.select([sys.stdin],[],[],0)[0], 'stale card generated response'
+  consent_id='replacement-consent'
+  send({'type':'control_request','request_id':consent_id,'request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'tool-2','input':{'command':'printf safe','timeout':2000}}})
+ reply=read();assert reply=={'type':'control_response','response':{'subtype':'success','request_id':consent_id,'response':{'behavior':'allow','updatedInput':{'command':'printf safe','timeout':2000}}}}
+ observe('approved-original')
+ send({'type':'result','session_id':a['session_id'],'subtype':'success'})
+ b=read();assert b['type']=='user' and b['uuid']!=a['uuid'];assert b['session_id']==a['session_id'];assert b['message']['content']=='private-claude-fixture\nexact text'
+ observe('second-input');release()
+ b['isReplay']=True;send(b)
+ send({'type':'result','session_id':b['session_id'],'subtype':'success'})
+sys.stdin.read()
+"#;
+    #[test]
+    fn claude_fake_process_bootstrap_consent_shared_admission_and_owned_cleanup() {
+        fixture("accept");
+        fixture("cancel");
+    }
+    #[test]
+    fn claude_fake_process_reset_mismatch_completion_and_flood_retire() {
+        for mode in [
+            "reset",
+            "reset-after-replay",
+            "wrong",
+            "result-first",
+            "overflow",
+            "stderr",
+        ] {
+            fixture(mode);
+        }
+    }
+    fn fixture(mode: &str) {
+        use std::io::BufRead;
+        let Ok(bootstrap) = crate::platform::RecipientBootstrap::new() else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-claude-fixture-{}",
+            crate::platform::recipient_random().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let args = vec![
+            bootstrap.path().to_string_lossy().into_owned(),
+            bootstrap.nonce.clone(),
+            directory.to_string_lossy().into_owned(),
+        ];
+        let owner = Owner::launch(
+            ProviderKind::Claude,
+            RecipientIdentity {
+                server_instance: "fixture-server".into(),
+                recipient_token: "fixture-recipient".into(),
+                terminal_id: "fixture-terminal".into(),
+            },
+            bootstrap,
+            std::process::id(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut command = Command::new("python3");
+        command
+            .args(["-u", "-c", SCRIPT])
+            .env(
+                "HERDR_FIXTURE_OBSERVER",
+                listener.local_addr().unwrap().port().to_string(),
+            )
+            .env("HERDR_FIXTURE_MODE", mode);
+        let (ui_tx, ui_rx) = mpsc::sync_channel(1);
+        let protocol = Protocol::Claude(super::super::claude::Claude::new(
+            args[2].clone(),
+            "fixed-fixture-session".into(),
+        ));
+        let helper = std::thread::spawn(move || {
+            run_protocol(&args, command, protocol, false, None, Some(ui_rx))
+        });
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut observer = BufReader::new(stream);
+        fn observed(reader: &mut BufReader<std::net::TcpStream>) -> String {
+            let mut s = String::new();
+            reader.read_line(&mut s).unwrap();
+            s.trim_end().into()
+        }
+        let descendant: u32 = observed(&mut observer).parse().unwrap();
+        owner.wait_for_phase(OwnerState::AwaitingSessionConfirmation);
+        assert!(owner
+            .codex_snapshot("fixture-terminal", Some("fixture-server"))
+            .exact_prompt
+            .is_none());
+        let text = "private-claude-fixture\nexact text";
+        ui_tx.send(Input::Text(text.into())).unwrap();
+        assert_eq!(observed(&mut observer), "first-input");
+        owner.wait_for_phase(OwnerState::ActiveTurn);
+        assert_eq!(
+            owner.reserve(&owner.identity, "desktop", text).unwrap_err(),
+            SubmissionOutcome::rejected("unsupported_recipient")
+        );
+        ui_tx
+            .send(Input::Text("second-bootstrap-must-not-write".into()))
+            .unwrap();
+        // A third UI event blocks until the single consumer has processed the second.
+        ui_tx
+            .send(Input::Decision(json!("nonexistent"), "allow".into()))
+            .unwrap();
+        observer.get_mut().write_all(b"continue\n").unwrap();
+        if matches!(mode, "accept" | "cancel") {
+            owner.wait_for_phase(OwnerState::PendingPermission);
+            let consent_id = if mode == "cancel" {
+                assert_eq!(observed(&mut observer), "cancel-ready");
+                observer.get_mut().write_all(b"continue\n").unwrap();
+                assert_eq!(observed(&mut observer), "cancelled");
+                owner.wait_for_phase(OwnerState::ActiveTurn);
+                ui_tx
+                    .send(Input::Decision(json!("consent"), "allow".into()))
+                    .unwrap();
+                ui_tx
+                    .send(Input::Decision(json!("nonexistent"), "allow".into()))
+                    .unwrap();
+                observer.get_mut().write_all(b"continue\n").unwrap();
+                owner.wait_for_phase(OwnerState::PendingPermission);
+                "replacement-consent"
+            } else {
+                "consent"
+            };
+            ui_tx
+                .send(Input::Decision(json!(consent_id), "allow".into()))
+                .unwrap();
+            assert_eq!(observed(&mut observer), "approved-original");
+            owner.wait_for_phase(OwnerState::Idle);
+            assert!(owner
+                .codex_snapshot("fixture-terminal", Some("fixture-server"))
+                .exact_prompt
+                .is_none());
+            ui_tx.send(Input::Text(text.into())).unwrap();
+            assert_eq!(observed(&mut observer), "second-input");
+            owner.wait_for_phase(OwnerState::ActiveTurn);
+            observer.get_mut().write_all(b"continue\n").unwrap();
+            owner.wait_for_phase(OwnerState::Idle);
+            owner.revoke();
+        }
+        let error = helper.join().unwrap().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if matches!(mode, "accept" | "cancel") {
+                io::ErrorKind::UnexpectedEof
+            } else if mode == "stderr" {
+                io::ErrorKind::Other
+            } else {
+                io::ErrorKind::InvalidData
+            },
+            "mode {mode}: {error}"
+        );
+        owner.wait_for_phase(OwnerState::Revoked);
+        let status=Command::new("python3").args(["-c", "import os,sys,time\npid=int(sys.argv[1]);end=time.monotonic()+3\nwhile True:\n try:os.kill(pid,0)\n except ProcessLookupError:break\n assert time.monotonic()<end,'owned descendant leaked'\n time.sleep(.01)", &descendant.to_string()]).status().unwrap();
+        assert!(status.success());
         assert!(std::fs::read_dir(&directory).unwrap().next().is_none());
         std::fs::remove_dir(directory).unwrap();
     }

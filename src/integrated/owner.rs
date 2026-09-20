@@ -15,6 +15,7 @@ use std::{
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OwnerState {
     Starting,
+    AwaitingSessionConfirmation,
     Idle,
     ActiveTurn,
     PendingPermission,
@@ -55,18 +56,30 @@ pub(crate) struct CodexSnapshot {
 /// Owns exactly one accepted stream. OnceLock has no replacement/rebind path.
 pub(crate) struct Owner {
     pub identity: RecipientIdentity,
+    provider: super::ProviderKind,
     stream: OnceLock<RecipientStream>,
     state: Mutex<State>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     observed: std::sync::Condvar,
 }
 impl Owner {
+    #[cfg(test)]
     pub(crate) fn launch_codex(
         identity: RecipientIdentity,
         bootstrap: RecipientBootstrap,
         pid: u32,
     ) -> Arc<Self> {
+        Self::launch(super::ProviderKind::Codex, identity, bootstrap, pid)
+    }
+
+    pub(crate) fn launch(
+        provider: super::ProviderKind,
+        identity: RecipientIdentity,
+        bootstrap: RecipientBootstrap,
+        pid: u32,
+    ) -> Arc<Self> {
         let owner = Arc::new(Self {
+            provider,
             identity,
             stream: OnceLock::new(),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -114,12 +127,15 @@ impl Owner {
         owner
     }
 
+    pub(crate) fn provider(&self) -> super::ProviderKind {
+        self.provider
+    }
+
     pub(crate) fn state(&self) -> OwnerState {
         self.state.lock().unwrap().phase
     }
 
-    /// Only `launch_codex` creates production owners. A future provider must
-    /// establish its own qualification instead of inheriting detected metadata.
+    /// Qualification belongs to the provider, never to terminal metadata.
     /// The snapshot is advisory; reserve rechecks admission atomically.
     pub(crate) fn codex_snapshot(
         &self,
@@ -133,7 +149,8 @@ impl Owner {
             };
         };
         let bound = self.stream.get().is_some();
-        let eligible = crate::platform::codex_exact_prompt_qualified()
+        let eligible = self.provider == super::ProviderKind::Codex
+            && crate::platform::codex_exact_prompt_qualified()
             && self.identity.terminal_id == terminal_id
             && Some(self.identity.server_instance.as_str()) == server_instance
             && state.initialized
@@ -162,6 +179,9 @@ impl Owner {
     ) -> Result<mpsc::Receiver<SubmissionOutcome>, SubmissionOutcome> {
         let mut state = self.state.lock().unwrap();
         let reject = |code| Err(SubmissionOutcome::rejected(code));
+        if self.provider != super::ProviderKind::Codex {
+            return reject("unsupported_recipient");
+        }
         if identity != &self.identity {
             return reject("stale_recipient");
         }
@@ -326,6 +346,7 @@ impl Owner {
 impl Owner {
     pub(crate) fn test_starting(identity: RecipientIdentity) -> Arc<Self> {
         Arc::new(Self {
+            provider: crate::integrated::ProviderKind::Codex,
             identity,
             stream: OnceLock::new(),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -358,6 +379,7 @@ mod tests {
     fn connected() -> Option<(Owner, RecipientStream)> {
         let (stream, peer) = crate::platform::recipient_test_pair().ok()?;
         let owner = Owner {
+            provider: crate::integrated::ProviderKind::Codex,
             identity: RecipientIdentity {
                 server_instance: "s".into(),
                 recipient_token: "r".into(),
@@ -374,6 +396,31 @@ mod tests {
             }),
         };
         Some((owner, peer))
+    }
+    #[test]
+    fn unqualified_claude_never_inherits_codex_capability_or_remote_admission() {
+        let Some((mut owner, _peer)) = connected() else {
+            return;
+        };
+        owner.provider = super::super::ProviderKind::Claude;
+        for phase in [
+            OwnerState::Starting,
+            OwnerState::AwaitingSessionConfirmation,
+            OwnerState::Idle,
+            OwnerState::ActiveTurn,
+            OwnerState::PendingPermission,
+            OwnerState::OutcomeUnknown,
+            OwnerState::Revoked,
+        ] {
+            owner.state.lock().unwrap().phase = phase;
+            assert!(owner.codex_snapshot("t", Some("s")).exact_prompt.is_none());
+            assert_eq!(
+                owner
+                    .reserve(&owner.identity, "request", "text")
+                    .unwrap_err(),
+                SubmissionOutcome::rejected("unsupported_recipient")
+            );
+        }
     }
     #[test]
     fn codex_snapshot_requires_bound_initialized_matching_owner_and_admission_budget() {

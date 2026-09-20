@@ -7,6 +7,7 @@ pub(crate) const EXACT_PROMPT_TRANSPORT: &str = "recipient_channel_v1";
 
 mod approvals;
 mod channel;
+mod claude;
 mod codex;
 pub(crate) mod helper;
 mod identity;
@@ -15,3 +16,24 @@ mod render;
 pub(crate) use identity::RecipientIdentity;
 pub(crate) use owner::OwnerLease;
 pub(crate) use owner::{Owner, OwnerState, SubmissionOutcome};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderKind {
+    Codex,
+    Claude,
+}
+impl ProviderKind {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}

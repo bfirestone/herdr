@@ -305,9 +305,7 @@ fn parse_integrated_start(
         }
     }
     let provider = provider?;
-    if provider != "codex" {
-        return None;
-    }
+    crate::integrated::ProviderKind::parse(&provider)?;
     Some(crate::api::schema::AgentStartIntegratedParams {
         provider,
         workspace_id: workspace_id?,
@@ -327,7 +325,7 @@ fn parse_start_mode(args: &[String]) -> Result<StartMode, i32> {
         .any(|arg| arg == "--integrated")
     {
         return parse_integrated_start(args).map(StartMode::Integrated).ok_or_else(|| {
-            eprintln!("usage: herdr agent start --integrated codex --workspace WORKSPACE_ID --cwd TRUSTED_ABSOLUTE_PATH");
+            eprintln!("usage: herdr agent start --integrated codex|claude --workspace WORKSPACE_ID --cwd TRUSTED_ABSOLUTE_PATH");
             2
         });
     }
@@ -1024,6 +1022,22 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
 #[cfg(test)]
 mod integrated_start_tests {
     use super::*;
+    #[test]
+    fn integrated_claude_is_explicitly_parsed_without_legacy_fallback() {
+        let args = [
+            "--integrated",
+            "claude",
+            "--workspace",
+            "w1",
+            "--cwd",
+            "/tmp/trusted",
+        ]
+        .map(str::to_owned);
+        let Ok(StartMode::Integrated(params)) = parse_start_mode(&args) else {
+            panic!("Claude integrated launch must be supported");
+        };
+        assert_eq!(params.provider, "claude");
+    }
     #[test]
     fn integrated_route_and_legacy_forwarding_respect_separator() {
         let args: Vec<String> = [

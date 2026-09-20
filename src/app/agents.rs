@@ -388,7 +388,9 @@ impl App {
                 .and_then(|snapshot| snapshot.exact_prompt.clone()),
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
-            agent: integrated.map(|_| "codex".to_owned()).or(pane.agent),
+            agent: integrated
+                .map(|owner| owner.provider().name().to_owned())
+                .or(pane.agent),
             title: pane.title,
             terminal_title: pane.terminal_title,
             terminal_title_stripped: pane.terminal_title_stripped,
@@ -437,7 +439,7 @@ impl App {
 }
 
 impl App {
-    pub(super) fn start_integrated_codex(
+    pub(super) fn start_integrated_provider(
         &mut self,
         params: crate::api::schema::AgentStartIntegratedParams,
     ) -> std::io::Result<(
@@ -449,9 +451,8 @@ impl App {
         if self.integrated_owners.len() >= 128 {
             return Err(std::io::Error::other("integrated recipient limit reached"));
         }
-        if params.provider != "codex" {
-            return Err(std::io::ErrorKind::Unsupported.into());
-        }
+        let provider = crate::integrated::ProviderKind::parse(&params.provider)
+            .ok_or(std::io::ErrorKind::Unsupported)?;
         let ws_idx = self
             .parse_workspace_id(&params.workspace_id)
             .ok_or(std::io::ErrorKind::NotFound)?;
@@ -485,6 +486,7 @@ impl App {
             bootstrap.path().to_string_lossy().into_owned(),
             bootstrap.nonce.clone(),
             params.cwd,
+            provider.name().into(),
         ];
         let (rows, cols) = self.state.estimate_pane_size();
         let (tab_idx, terminal, mut runtime) = self.state.workspaces[ws_idx]
@@ -505,7 +507,7 @@ impl App {
             recipient_token: token,
             terminal_id: terminal_id.to_string(),
         };
-        let owner = crate::integrated::Owner::launch_codex(identity.clone(), bootstrap, pid);
+        let owner = crate::integrated::Owner::launch(provider, identity.clone(), bootstrap, pid);
         runtime.bind_integrated_owner(owner.lease());
         self.integrated_owners
             .insert(identity.terminal_id.clone(), owner);

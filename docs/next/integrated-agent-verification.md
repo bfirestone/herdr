@@ -9,7 +9,7 @@ PTY agents are unsupported; there is no PTY prompt fallback.
 **Codex T3 is qualified within the boundaries below** by the combined source
 audit, deterministic tests, independent public API evaluation, native/npm live
 smoke and actual platform CI. The qualified code revision is
-`f84d5dd80df7dfbac9079486ad5836d343901d9d`. Claude implementation and proof remain
+`f84d5dd80df7dfbac9079486ad5836d343901d9d`. Claude implementation is present but its real-provider proof remains
 open, so this does not complete Desktop M2 SC0 or the whole M2 milestone.
 
 ## Final qualification evidence
@@ -123,7 +123,7 @@ remain retained; the final actual macOS job supplies the portability proof.
 | Same owner during active turn, pending consent or unknown outcome | Identity retained, `ready: false`; admission refused |
 | Starting/unbound, exited, reset, or revoked owner | No recipient capability; token cannot revive or rebind |
 | Other Codex versions | Initialization fails closed |
-| Claude Code | Unsupported; integrated launch rejected pending its own implementation/proof |
+| Claude Code 2.1.276 / SDK 0.3.276 | Local integrated launch implemented; no exact-prompt capability or desktop admission until its own real-provider proof |
 | Windows or other platforms | No server capability |
 | Shell-launched/detected or restored session without a live owner | No recipient capability, regardless of Codex/Claude-looking metadata |
 

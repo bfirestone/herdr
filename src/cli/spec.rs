@@ -406,7 +406,7 @@ fn agent_command() -> Command {
                     "herdr agent start <NAME> --kind <KIND> --pane <ID> [OPTIONS] [-- [AGENT_ARG]...]",
                 )
                 .arg(Arg::new("name").value_name("NAME").required_unless_present("integrated"))
-                .arg(option("integrated", "PROVIDER").value_parser(["codex"]).conflicts_with_all(["name", "kind", "pane", "agent_args"]).requires_all(["workspace", "cwd"]))
+                .arg(option("integrated", "PROVIDER").value_parser(["codex", "claude"]).conflicts_with_all(["name", "kind", "pane", "agent_args"]).requires_all(["workspace", "cwd"]))
                 .arg(option("workspace", "WORKSPACE_ID").requires("integrated"))
                 .arg(option("cwd", "TRUSTED_ABSOLUTE_PATH").requires("integrated"))
                 .arg(

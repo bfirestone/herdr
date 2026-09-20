@@ -402,7 +402,7 @@ impl App {
         id: String,
         params: crate::api::schema::AgentStartIntegratedParams,
     ) -> String {
-        let result = self.start_integrated_codex(params);
+        let result = self.start_integrated_provider(params);
         match result {
             Ok((agent, identity)) => encode_success(
                 id,
