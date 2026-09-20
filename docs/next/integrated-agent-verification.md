@@ -6,14 +6,68 @@ readiness: a recipient appears only after authenticated initialization and fixed
 thread creation; it is ready only while idle with admission capacity. Ordinary
 PTY agents are unsupported; there is no PTY prompt fallback.
 
-The latest completed actual platform evidence is the **predecessor revision
-`5609f4604d36af16eb4e41e360292e29759f9d0b`**. The capability activation revision
-still requires independent review, final native/npm live public-API smoke, and
-both actual platform jobs on its own exact commit. These remaining gates keep
-Codex task closure pending. Desktop M2 SC0 additionally requires subsequent
-Claude implementation and proof.
+**Codex T3 is qualified within the boundaries below** by the combined source
+audit, deterministic tests, independent public API evaluation, native/npm live
+smoke and actual platform CI. The qualified code revision is
+`f84d5dd80df7dfbac9079486ad5836d343901d9d`. Claude implementation and proof remain
+open, so this does not complete Desktop M2 SC0 or the whole M2 milestone.
+
+## Final qualification evidence
+
+[Run 35485588104](https://github.com/bfirestone/herdr/actions/runs/35485588104)
+passed both jobs on that exact code revision with Rust 1.98.1:
+
+- [Ubuntu job 106011233506](https://github.com/bfirestone/herdr/actions/runs/35485588104/job/106011233506):
+  Ubuntu 24.04 x86_64; 3,882 Rust tests passed, six existing skips, all auxiliary
+  and documentation gates passed. Both Codex 0.154.0 native/npm candidates passed
+  null/private-pipe/PTY, hook and MCP descriptor checks, actual nonroot confinement,
+  no-drift preview and exact profile/path/restriction/provider restoration.
+- [macOS job 106011233636](https://github.com/bfirestone/herdr/actions/runs/35485588104/job/106011233636):
+  macOS arm64; 3,660 Rust tests passed, six existing skips, all auxiliary and
+  documentation gates and both Codex 0.154.0 native/npm descriptor checks passed.
+  The repaired public API fixtures passed with the runner's normal TMPDIR.
+
+The activation revision `6f9265028388205e2b63943c3d83799f20229280` passed root-run
+native/npm live public-capability, fixed-thread, acknowledgment, harmless model
+response, manual Allow/Deny and owned-cleanup checks on macOS arm64. The change
+from that revision to `f84d5dd` affects only the API test fixture. The evaluator
+independently verified that the production executable is byte-identical:
+SHA-256 `3baaa7c72efcdc058414afb58d25e3a5bf72c8e067f106f551b092fa59f2081e`.
+Those live results are reused exact-artifact evidence, not a claim that live
+model calls were repeated at `f84d5dd`.
+
+| Criterion | Source proof | Deterministic / public API proof | Live provider proof | Platform boundary |
+| --- | --- | --- | --- | --- |
+| Fixed recipient and acknowledgment | Pinned thread lookup, captured thread and admission response audit below | Fixed identity, exact Unicode/65,536-byte input, correlated acknowledgment and zero-write rejection | Both launchers: fixed thread, matching acknowledgment, harmless response | Live: macOS arm64; transport/API fixtures: both CI jobs |
+| Capability and readiness projection | Owned launch and coherent fail-closed owner snapshot | Ping/list/get/snapshot, initialization/thread barriers, busy/consent transitions, invalid handshakes | Both launchers: public projection on actual launch and consent transitions | macOS/Linux source gate; only listed architectures exercised |
+| Reset/replacement and queued input | Owner retirement and separate helper/control streams | Forced buffered/partial-write schedules, unknown outcome, stale-token exclusion and replacement isolation | Not forced by live smoke | Deterministic evidence in both platform suites |
+| Child control-stream isolation | Shell/PTY/pipe, hook, MCP and npm-wrapper audit below | Harness safety and ownership tests | Shipped native/npm null/private-pipe/PTY, hook and MCP descriptor fixtures; no model sampling | macOS arm64 and confined disposable Ubuntu 24.04 x86_64 candidate |
+| Explicit permission decisions | Correlated approval request and owner readiness | Approval correlation tests; evaluator consent check is supplementary | Both launchers: displayed matching cards, Deny prevents write, Allow produces expected content | macOS arm64, explicit disposable manual-review policy only |
+| Owned lifetime and bootstrap | Owner revocation and helper teardown paths | Handshake failures, exit and fixture teardown; long-TMPDIR regression checks both sockets | Each live/descriptor candidate reports owned cleanup PASS | Candidate cleanup is proven; whole-suite lifetime/CPU limits remain below |
+
+Code review is ADHERENT and specification review COMPLIANT. The evaluator's
+retained acceptance contains 20 independent public API checks plus one
+supplementary consent check; it independently revalidated the executable and
+retained artifacts at `f84d5dd`, without rerunning those behavior checks. Consent
+is supplementary because an earlier source read exposed approval-field details.
+The retained setup failures and this independence limit were not erased. Root's
+separate local gates passed 3,660 Rust tests (six existing skips), all auxiliary
+checks and seven documentation tests.
+
+The retained revision6 bundle includes `final-qualified-evidence.json`,
+`actual-linux-f84d5dd-reports.json`, `actual-macos-f84d5dd-reports.json`, their
+complete job logs, `root-live-reports.json` and the review/evaluation reports.
+Per-mode `qualification: UNVERIFIED` remains in the raw harness reports:
+descriptor mode does not establish model/manual consent, while live mode leaves
+`child_fd_isolation` and `queued_reset_replacement` unverified. The combined
+criterion-specific evidence above establishes this qualification; no single
+mode is promoted to proof of every criterion. This documentation update does
+not claim that actual CI ran on its later documentation-only commit.
 
 ## Qualification boundary and actual predecessor evidence
+
+The earlier completed platform evidence remains the predecessor revision
+`5609f4604d36af16eb4e41e360292e29759f9d0b`:
 
 [Run 35481702996](https://github.com/bfirestone/herdr/actions/runs/35481702996)
 passed on the exact predecessor above with Rust 1.98.1:
@@ -31,22 +85,41 @@ passed on the exact predecessor above with Rust 1.98.1:
   descriptor checks passed. One HTTP handoff test was slow.
 
 The source platform gate selects the macOS/Linux transport implementations.
-Actual CI exercised only the architectures listed above; other architectures
-and native Linux graphical fidelity are not established by these runs.
+Actual CI exercised only macOS arm64 and Ubuntu 24.04 x86_64. Linux descriptor
+qualification uses the confined disposable runtime documented below, not an
+arbitrary host's default policy. Other architectures, Linux graphical fidelity
+and Linux live model/manual-consent behavior are not established by these runs.
 
 These CI descriptor checks use empty provider homes and no account or model
 sampling. The macOS model, fixed-thread acknowledgment and actual manual Allow/
 Deny evidence is separately recorded below. Its stricter manual-review launcher
 is a disposable-test exception, never production policy.
 
-The Ubuntu runner's final cleanup killed four `herdr` and four `sh` processes
-from unknown tests. No CPU, ancestry or provenance samples identify the cause.
+The predecessor Ubuntu runner's final cleanup killed four `herdr` and four `sh`
+processes from unknown tests. The final `f84d5dd` run is the fourth observed Linux
+run with that four-plus-four residue. No CPU, ancestry or provenance samples identify the cause.
 Follow-up `herdr-0gdv.01btdj` tracks that suite-level lifetime gap. Individual
 candidate cleanup PASS does not prove the entire suite had no surviving processes.
+No corresponding runner termination lines were observed in the final macOS log;
+that observation is not a whole-suite CPU or lifetime guarantee.
+
+The intervening activation [run 35484221224](https://github.com/bfirestone/herdr/actions/runs/35484221224)
+at `6f9265028388205e2b63943c3d83799f20229280` passed Linux (3,881 Rust tests,
+six existing skips and native/npm descriptor/confinement/restoration checks),
+but failed all three new macOS public API fixtures waiting for their sockets.
+A 48-byte macOS-style TMPDIR produced a 106-byte API socket pathname. The bounded
+reproduction found the socket library rejected it with `InvalidInput` and no
+raw OS errno before binding. The repair uses an exclusively created private
+compact fixture catalog, preserves lexical socket paths and canonical cwd, and
+tests both API/client listeners under a long temporary root. No production
+behavior, deadline, assertion or CI TMPDIR workaround changed. The first repair
+run also exposed separate client-listener readiness; the fixture now waits for
+that endpoint with the existing deadline. Both failures and their cleanup logs
+remain retained; the final actual macOS job supplies the portability proof.
 
 | Recipient / environment | Compatibility boundary |
 | --- | --- |
-| Owned integrated Codex 0.154.0, verified macOS/Linux transport | Source gate enabled; new activation commit awaits final exact-revision qualification |
+| Owned integrated Codex 0.154.0, verified macOS/Linux transport | Qualified by the combined evidence above; actual architectures and Linux runtime policy are bounded as documented |
 | Same owner during active turn, pending consent or unknown outcome | Identity retained, `ready: false`; admission refused |
 | Starting/unbound, exited, reset, or revoked owner | No recipient capability; token cannot revive or rebind |
 | Other Codex versions | Initialization fails closed |
@@ -61,7 +134,7 @@ admission, correlated provider acceptance, busy/consent readiness, reset and
 replacement. Owner tests cover unknown outcome, identity mismatch, unbound state
 and admission-budget exhaustion. The opt-in live smoke now also verifies public
 ping/list/get/snapshot fields against its actual launch and consent transitions.
-Scripted acceptance is not a replacement for that final provider smoke.
+Scripted acceptance and the completed live provider smoke supply separate proof.
 
 ## Supported candidate and source identity
 
@@ -159,8 +232,8 @@ hook and MCP checks. Both recorded owned cleanup PASS and a matching stopped
 hook without model output. The fixtures create an empty owned `CODEX_HOME`,
 remove OpenAI authentication environment and Codex key/token variables, preserve
 OS HOME, and require `account/read` to return no account. Both passed in this
-unauthenticated configuration. The later actual predecessor CI result above
-adds Linux evidence; this early local run alone did not qualify Linux.
+unauthenticated configuration. The later actual predecessor and final CI results
+above add Linux evidence; this early local run alone did not qualify Linux.
 
 An attempted supplementary source-library test command,
 `cargo test --locked -p codex-hooks -p codex-rmcp-client -p codex-utils-pty --lib`,
@@ -213,8 +286,14 @@ approval card for each exact owned operation, Deny prevented its scratch write,
 and Allow produced only the expected file content. Fixed thread, matching
 acknowledgment, harmless response and owned cleanup all passed. No prompt used
 PTY input. Normal-policy no-card observations above remain separate evidence.
-These pre-activation live results are retained. The final activation revision
-still needs the extended smoke and both exact-commit CI jobs described above.
+These pre-activation live results are retained. Root subsequently passed the
+extended smoke for both launchers at activation revision `6f92650`, including
+public ping/list/get/snapshot projection and consent readiness. Both runs used
+the explicit disposable manual-review policy and reported owned cleanup PASS;
+their supervisors recorded no rescue or unresolved owned process. The verified
+byte-identical `f84d5dd` production artifact reuses these results alongside its
+own completed actual platform CI, as recorded above. This does not establish
+live model/manual-consent behavior on Linux or another architecture.
 
 Example (supply the exact previously validated executables; never auto-install):
 
@@ -246,8 +325,8 @@ and runs full `just ci`,
 `just docs-contract-test`, bootstrap/adversarial fixtures, and pinned native/npm
 provider descriptor checks on macOS and Ubuntu. It requests no authentication
 secrets and never runs the live model/permission smoke on pull requests.
-A workflow definition alone is not Linux or macOS run evidence. Record its exact
-run revision and results before closing the platform gate.
+A workflow definition alone is not Linux or macOS run evidence. The final exact
+code revision and actual job links above establish the completed platform gate.
 
 Historical local validation before runtime and capability activation: `RUSTUP_TOOLCHAIN=1.98.1 just ci`
 passed (3,511 nextest tests, six skipped, plus repository maintenance and asset
@@ -256,7 +335,8 @@ used a process-only `commit.gpgsign=false` override; saved Git settings were
 unchanged. An earlier restricted-host run failed process-observation and host-key
 fixtures; the complete run with normal host access passed. No unrelated failure
 was silently waived. That historical run did not supply actual macOS/Linux CI evidence; the
-predecessor platform results above now do.
+predecessor and final platform results above do. Final local/root gates and
+independent review/evaluation are recorded separately from that historical run.
 
 ## Bounded Ubuntu runtime experiment history
 
@@ -270,7 +350,7 @@ or specific denying LSM rule**. AppArmor was enabled and its unprivileged-userns
 restriction was 1. Baseline LSM attribution remains unknown; no audit policy or
 logging service is changed to manufacture evidence.
 
-A separate, unqualified CI experiment targets only the disposable Ubuntu 24.04
+A separate CI experiment, initially unqualified, targets only the disposable Ubuntu 24.04
 x86_64 job on `bfirestone/herdr`, branch `feat/desktop-exact-delivery`.
 `scripts/ci_codex_sandbox.py` has explicit `plan`, `apply`, `verify`, `cleanup`,
 `baseline`, and `candidate` modes. It refuses other OS/repository/ref/user targets.
@@ -495,6 +575,9 @@ observations and denial controls. They run through the existing Rust integration
 gate. They are **not host-kernel or live CI enforcement evidence**. The predecessor
 run above subsequently passed separate baseline/candidate recording, both complete
 fixture checks, unchanged restrictions, no-drift preview and restored cleanup.
-The activation revision still requires its own final live public capability smoke
-and exact macOS/Linux jobs; local tests and workflow definitions alone do not
-close Desktop M2/T3.
+The final `f84d5dd` jobs repeated those runtime checks successfully. Combined with
+the source audit, deterministic and independent public API evidence, and the
+native/npm live smoke on the verified identical production artifact, they
+complete Codex T3 qualification within the stated boundaries. Per-mode evidence
+limits and the open suite-lifetime follow-up remain explicit. Claude and the
+whole Desktop M2/SC0 milestone remain open.
