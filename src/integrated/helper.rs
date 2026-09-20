@@ -42,10 +42,16 @@ impl Protocol {
             Self::Claude(p) => p.event(frame),
         }
     }
-    fn decision(&mut self, id: &serde_json::Value, decision: &str) -> Vec<Effect> {
+    fn decision(&mut self, id: &serde_json::Value, decision: &str) -> Result<Vec<Effect>, ()> {
         match self {
-            Self::Codex(p) => p.decision(id, decision),
-            Self::Claude(p) => p.decision(id, decision),
+            Self::Codex(p) => Ok(p.decision(id, decision)),
+            Self::Claude(p) => {
+                let effects = p.decision(id, decision);
+                if p.state == super::OwnerState::Revoked {
+                    return Err(());
+                }
+                Ok(effects)
+            }
         }
     }
     fn cards(&self) -> Vec<super::approvals::Card> {
@@ -257,9 +263,11 @@ fn run_protocol(
                                 protocol.submit(SubmissionOrigin::Local(local_sequence), text),
                             );
                         }
-                        Input::Decision(id, decision) => {
-                            effects.extend(protocol.decision(&id, &decision))
-                        }
+                        Input::Decision(id, decision) => effects.extend(
+                            protocol
+                                .decision(&id, &decision)
+                                .map_err(|_| io::ErrorKind::InvalidData)?,
+                        ),
                     }
                 }
                 for effect in effects.drain(..) {
@@ -712,6 +720,14 @@ while True:
 mod claude_tests {
     use super::*;
     use crate::integrated::{Owner, OwnerState, ProviderKind, SubmissionOutcome};
+    #[test]
+    fn revoked_claude_decision_enters_helper_error_teardown() {
+        let mut claude = super::super::claude::Claude::new("/tmp/trusted".into(), "fixed".into());
+        claude.state = OwnerState::Revoked;
+        let mut protocol = Protocol::Claude(claude);
+        assert!(protocol.decision(&json!("stale"), "allow").is_err());
+        assert_eq!(protocol.state(), OwnerState::Revoked);
+    }
     const SCRIPT: &str = r#"
 import json,sys,os,socket,subprocess,select
 child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])
@@ -746,7 +762,10 @@ elif mode=='stderr':
  try:sys.stderr.write('x'*65537);sys.stderr.flush()
  except BrokenPipeError:pass
 else:
+ send({'type':'system','subtype':'init','session_id':a['session_id'],'uuid':'init-first','cwd':os.getcwd(),'claude_code_version':'2.1.276','permissionMode':'default'})
+ send({'type':'rate_limit_event','session_id':a['session_id'],'uuid':'rate-before','rate_limit_info':{'status':'allowed'}})
  a['isReplay']=True;send(a)
+ send({'type':'rate_limit_event','session_id':a['session_id'],'uuid':'rate-after','rate_limit_info':{'status':'allowed_warning','utilization':0.9}})
  send({'type':'control_request','request_id':'consent','request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'tool-1','input':{'command':'printf safe','timeout':2000}}})
  consent_id='consent'
  if mode=='cancel':
@@ -756,11 +775,18 @@ else:
   assert not select.select([sys.stdin],[],[],0)[0], 'stale card generated response'
   consent_id='replacement-consent'
   send({'type':'control_request','request_id':consent_id,'request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'tool-2','input':{'command':'printf safe','timeout':2000}}})
- reply=read();assert reply=={'type':'control_response','response':{'subtype':'success','request_id':consent_id,'response':{'behavior':'allow','updatedInput':{'command':'printf safe','timeout':2000}}}}
+ send({'type':'tool_progress','session_id':a['session_id'],'uuid':'heartbeat','tool_use_id':'tool-1','tool_name':'Bash','parent_tool_use_id':None,'elapsed_time_seconds':1,'heartbeat':True})
+ reply=read()
+ expected={'behavior':'deny','message':'User declined integrated operation'} if mode=='deny' else {'behavior':'allow','updatedInput':{'command':'printf safe','timeout':2000}}
+ assert reply=={'type':'control_response','response':{'subtype':'success','request_id':consent_id,'response':expected}}
+ send(reply)
+ send({'type':'user','session_id':a['session_id'],'uuid':'tool-result','parent_tool_use_id':None,'message':{'role':'user','content':[{'type':'tool_result','tool_use_id':'tool-1','content':'declined' if mode=='deny' else 'safe','is_error':mode=='deny'}]},'tool_use_result':'declined' if mode=='deny' else {'stdout':'safe'}})
+ send({'type':'assistant','session_id':a['session_id'],'message':{'role':'assistant','content':[{'type':'text','text':'Tool settled.'}]}})
  observe('approved-original')
  send({'type':'result','session_id':a['session_id'],'subtype':'success'})
  b=read();assert b['type']=='user' and b['uuid']!=a['uuid'];assert b['session_id']==a['session_id'];assert b['message']['content']=='private-claude-fixture\nexact text'
  observe('second-input');release()
+ send({'type':'system','subtype':'init','session_id':b['session_id'],'uuid':'init-second','cwd':os.getcwd(),'claude_code_version':'2.1.276','permissionMode':'default'})
  b['isReplay']=True;send(b)
  send({'type':'result','session_id':b['session_id'],'subtype':'success'})
 sys.stdin.read()
@@ -768,6 +794,7 @@ sys.stdin.read()
     #[test]
     fn claude_fake_process_bootstrap_consent_shared_admission_and_owned_cleanup() {
         fixture("accept");
+        fixture("deny");
         fixture("cancel");
     }
     #[test]
@@ -858,7 +885,7 @@ sys.stdin.read()
             .send(Input::Decision(json!("nonexistent"), "allow".into()))
             .unwrap();
         observer.get_mut().write_all(b"continue\n").unwrap();
-        if matches!(mode, "accept" | "cancel") {
+        if matches!(mode, "accept" | "deny" | "cancel") {
             owner.wait_for_phase(OwnerState::PendingPermission);
             let consent_id = if mode == "cancel" {
                 assert_eq!(observed(&mut observer), "cancel-ready");
@@ -878,7 +905,10 @@ sys.stdin.read()
                 "consent"
             };
             ui_tx
-                .send(Input::Decision(json!(consent_id), "allow".into()))
+                .send(Input::Decision(
+                    json!(consent_id),
+                    if mode == "deny" { "deny" } else { "allow" }.into(),
+                ))
                 .unwrap();
             assert_eq!(observed(&mut observer), "approved-original");
             owner.wait_for_phase(OwnerState::Idle);
@@ -896,7 +926,7 @@ sys.stdin.read()
         let error = helper.join().unwrap().unwrap_err();
         assert_eq!(
             error.kind(),
-            if matches!(mode, "accept" | "cancel") {
+            if matches!(mode, "accept" | "deny" | "cancel") {
                 io::ErrorKind::UnexpectedEof
             } else if mode == "stderr" {
                 io::ErrorKind::Other

@@ -18,11 +18,12 @@ pub(super) struct Claude {
     session: String,
     cwd: String,
     stage: u8,
-    init_seen: bool,
     confirmed: bool,
     pending: Option<Pending>,
     cards: BTreeMap<String, Card>,
     seen_controls: HashSet<String>,
+    // At most 16 cards plus settlements, each settlement at most 64 KiB (1 MiB total).
+    settlements: BTreeMap<String, Value>,
     pub state: OwnerState,
 }
 
@@ -44,11 +45,11 @@ impl Claude {
             cwd,
             session,
             stage: 0,
-            init_seen: false,
             confirmed: false,
             pending: None,
             cards: BTreeMap::new(),
             seen_controls: HashSet::new(),
+            settlements: BTreeMap::new(),
             state: OwnerState::Starting,
         }
     }
@@ -122,6 +123,14 @@ impl Claude {
         match frame["type"].as_str().ok_or(())? {
             "control_response" => {
                 let response = &frame["response"];
+                if self.stage == 2 {
+                    let id = control_id(response)?;
+                    if self.settlements.get(id) != Some(&frame) {
+                        return Err(());
+                    }
+                    self.settlements.remove(id);
+                    return Ok(vec![]);
+                }
                 if response["subtype"] != "success" {
                     return Err(());
                 }
@@ -163,6 +172,33 @@ impl Claude {
             }
             "keep_alive" => Ok(vec![]),
             "conversation_reset" => Err(()),
+            "user" if frame["isReplay"] != true => {
+                self.ordinary_context(&frame, true)?;
+                if frame.get("parent_tool_use_id") != Some(&Value::Null)
+                    || frame.get("isReplay").is_some_and(|v| v != false)
+                    || frame["message"]["role"] != "user"
+                    || self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| frame["uuid"] == p.uuid)
+                    || !frame["message"]["content"]
+                        .as_array()
+                        .is_some_and(|blocks| {
+                            !blocks.is_empty()
+                                && blocks.iter().all(|b| {
+                                    b["type"] == "tool_result"
+                                        && bounded_id(&b["tool_use_id"])
+                                        && b.get("is_error").is_none_or(Value::is_boolean)
+                                        && b.get("content")
+                                            .is_none_or(|v| v.is_string() || v.is_array())
+                                })
+                        })
+                {
+                    return Err(());
+                }
+                // Ordinary tool output is never an input acknowledgment.
+                Ok(vec![])
+            }
             "user" => {
                 let pending = self.pending.as_ref().ok_or(())?;
                 if self.stage != 2
@@ -176,7 +212,7 @@ impl Claude {
                 {
                     return Err(());
                 }
-                let pending = self.pending.take().unwrap();
+                let pending = self.pending.take().ok_or(())?;
                 self.confirmed = true;
                 Ok(vec![Effect::Result(
                     pending.origin,
@@ -208,6 +244,8 @@ impl Claude {
                     return Err(());
                 }
                 self.cards.clear();
+                // Error settlements need not echo. Never carry stale responses into a new turn.
+                self.settlements.clear();
                 self.state = OwnerState::Idle;
                 Ok(vec![
                     Effect::State(self.state),
@@ -215,27 +253,28 @@ impl Claude {
                 ])
             }
             "system" => {
-                if frame["session_id"] != self.session {
-                    return Err(());
-                }
+                self.ordinary_context(&frame, false)?;
                 if frame["subtype"] == "init" {
-                    if self.init_seen
+                    if self.stage != 2
                         || frame["claude_code_version"] != VERSION
                         || frame["cwd"] != self.cwd
                         || !frame["permissionMode"].is_string()
                     {
                         return Err(());
                     }
-                    self.init_seen = true;
                     return Ok(vec![Effect::Text(format!(
                         "Claude configured permission mode: {}\n",
                         frame["permissionMode"]
                     ))]);
                 }
-                if matches!(
-                    frame["subtype"].as_str(),
-                    Some("conversation_reset" | "worker_shutting_down")
-                ) {
+                if !ordinary_system(&frame) {
+                    return Err(());
+                }
+                Ok(vec![])
+            }
+            "rate_limit_event" | "tool_progress" | "tool_use_summary" => {
+                self.ordinary_context(&frame, frame["type"] != "rate_limit_event")?;
+                if !ordinary_information(&frame) {
                     return Err(());
                 }
                 Ok(vec![])
@@ -259,6 +298,37 @@ impl Claude {
             _ => Err(()),
         }
     }
+    fn ordinary_context(&self, frame: &Value, active: bool) -> Result<(), ()> {
+        if self.stage != 2
+            || frame["session_id"] != self.session
+            || !bounded_id(&frame["uuid"])
+            || frame
+                .get("parent_tool_use_id")
+                .is_some_and(|v| !v.is_null())
+            || frame.get("subagent_type").is_some()
+            || frame.get("agent_id").is_some()
+            || (active
+                && !matches!(
+                    self.state,
+                    OwnerState::ActiveTurn | OwnerState::PendingPermission
+                ))
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+    fn settlement(&mut self, id: &str, frame: Value) -> Result<Effect, ()> {
+        // The pinned input reader echoes successful settlements with replay enabled;
+        // errors can be consumed without an echo. Both are optional, exact, one-use.
+        if self.settlements.len() + self.cards.len() >= 16
+            || serde_json::to_vec(&frame).map_err(|_| ())?.len() > 64 * 1024
+            || self.settlements.contains_key(id)
+        {
+            return Err(());
+        }
+        self.settlements.insert(id.into(), frame.clone());
+        Ok(Effect::Write(frame))
+    }
     fn control(&mut self, frame: Value) -> Result<Vec<Effect>, ()> {
         let id = control_id(&frame)?.to_owned();
         if self.stage != 2
@@ -266,7 +336,7 @@ impl Claude {
                 self.state,
                 OwnerState::ActiveTurn | OwnerState::PendingPermission
             )
-            || self.cards.len() >= 16
+            || self.cards.len() + self.settlements.len() >= 16
             || self.seen_controls.len() >= 4096
             || !self.seen_controls.insert(id.clone())
         {
@@ -280,19 +350,22 @@ impl Claude {
         if request["subtype"] != "can_use_tool" {
             return Ok(vec![
                 Effect::Text("Unsupported Claude control denied.\n".into()),
-                Effect::Write(
+                self.settlement(&id,
                     json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":"Unsupported integrated interaction"}}),
-                ),
+                )?,
             ]);
         }
         let supported = supported_request(request);
         if !supported {
             return Ok(vec![
                 Effect::Text("Unsupported or incomplete Claude operation denied.\n".into()),
-                Effect::Write(permission_response(
+                self.settlement(
                     &id,
-                    json!({"behavior":"deny","message":"Unsupported integrated interaction"}),
-                )),
+                    permission_response(
+                        &id,
+                        json!({"behavior":"deny","message":"Unsupported integrated interaction"}),
+                    ),
+                )?,
             ]);
         }
         let mut details = serde_json::to_string_pretty(request).map_err(|_| ())?;
@@ -302,17 +375,17 @@ impl Claude {
         if super::render::sanitize(&details).len() > 16 * 1024 {
             return Ok(vec![
                 Effect::Text("Claude consent exceeds the display bound; denied.\n".into()),
-                Effect::Write(permission_response(
+                self.settlement(&id, permission_response(
                     &id,
                     json!({"behavior":"deny","message":"Consent details exceed integrated display limit"}),
-                )),
+                ))?,
             ]);
         }
         self.cards.insert(
             id.clone(),
             Card {
                 id: json!(id),
-                method: format!("Claude {}", request["tool_name"].as_str().unwrap()),
+                method: format!("Claude {}", request["tool_name"].as_str().ok_or(())?),
                 params: request.clone(),
                 details,
             },
@@ -321,6 +394,9 @@ impl Claude {
         Ok(vec![Effect::State(self.state)])
     }
     pub fn decision(&mut self, id: &Value, decision: &str) -> Vec<Effect> {
+        if self.state == OwnerState::Revoked {
+            return vec![];
+        }
         let Some(id) = id.as_str() else {
             return vec![];
         };
@@ -351,10 +427,162 @@ impl Claude {
         } else {
             OwnerState::PendingPermission
         };
-        vec![
-            Effect::Write(permission_response(id, result)),
-            Effect::State(self.state),
-        ]
+        match self.settlement(id, permission_response(id, result)) {
+            Ok(write) => vec![write, Effect::State(self.state)],
+            Err(()) => {
+                self.cards.clear();
+                self.settlements.clear();
+                self.state = OwnerState::Revoked;
+                vec![Effect::State(self.state)]
+            }
+        }
+    }
+}
+fn bounded_id(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+}
+fn nonnegative(value: &Value) -> bool {
+    value.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0)
+}
+fn optional_fields(value: &Value, keys: &[&str], valid: fn(&Value) -> bool) -> bool {
+    keys.iter().all(|key| value.get(*key).is_none_or(valid))
+}
+fn ordinary_information(frame: &Value) -> bool {
+    // SDK 0.3.276 and the pinned print encoder emit these without partial output.
+    match frame["type"].as_str() {
+        Some("rate_limit_event") => {
+            let info = &frame["rate_limit_info"];
+            info.is_object()
+                && matches!(
+                    info["status"].as_str(),
+                    Some("allowed" | "allowed_warning" | "rejected")
+                )
+                && optional_fields(
+                    info,
+                    &[
+                        "resetsAt",
+                        "utilization",
+                        "overageResetsAt",
+                        "surpassedThreshold",
+                    ],
+                    nonnegative,
+                )
+                && optional_fields(
+                    info,
+                    &[
+                        "rateLimitType",
+                        "overageStatus",
+                        "overageDisabledReason",
+                        "limitScope",
+                        "errorCode",
+                    ],
+                    Value::is_string,
+                )
+                && optional_fields(
+                    info,
+                    &[
+                        "isUsingOverage",
+                        "overageInUse",
+                        "canUserPurchaseCredits",
+                        "hasChargeableSavedPaymentMethod",
+                    ],
+                    Value::is_boolean,
+                )
+        }
+        Some("tool_progress") => {
+            bounded_id(&frame["tool_use_id"])
+                && bounded_id(&frame["tool_name"])
+                && frame.get("parent_tool_use_id") == Some(&Value::Null)
+                && nonnegative(&frame["elapsed_time_seconds"])
+                && optional_fields(frame, &["heartbeat"], Value::is_boolean)
+                && optional_fields(frame, &["task_id"], bounded_id)
+                && frame.get("subagent_retry").is_none()
+        }
+        Some("tool_use_summary") => {
+            frame["summary"].is_string()
+                && frame["preceding_tool_use_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().all(bounded_id))
+        }
+        _ => false,
+    }
+}
+fn ordinary_system(frame: &Value) -> bool {
+    // An explicit informational allowlist replaces blanket system-message ignoring.
+    // Reset, compaction boundaries, fallback rewinds and untested local-consent
+    // transitions remain fail-closed; none of these messages acknowledges input.
+    match frame["subtype"].as_str() {
+        Some("status") => {
+            frame.get("status").is_some_and(|v| {
+                v.is_null() || matches!(v.as_str(), Some("compacting" | "requesting"))
+            }) && optional_fields(
+                frame,
+                &["permissionMode", "compact_result", "compact_error"],
+                Value::is_string,
+            )
+        }
+        Some("notification") => {
+            bounded_id(&frame["key"])
+                && frame["text"].is_string()
+                && matches!(
+                    frame["priority"].as_str(),
+                    Some("low" | "medium" | "high" | "immediate")
+                )
+                && optional_fields(frame, &["color"], Value::is_string)
+                && optional_fields(frame, &["timeout_ms"], nonnegative)
+        }
+        Some("api_retry") => {
+            ["attempt", "max_retries", "retry_delay_ms"]
+                .iter()
+                .all(|k| nonnegative(&frame[*k]))
+                && frame
+                    .get("error_status")
+                    .is_some_and(|v| v.is_null() || nonnegative(v))
+                && frame["error"].is_string()
+                && frame.get("no_response").is_none_or(|v| {
+                    nonnegative(&v["waited_ms"]) && nonnegative(&v["retry_wait_ms"])
+                })
+        }
+        Some("thinking_tokens") => {
+            nonnegative(&frame["estimated_tokens"])
+                && nonnegative(&frame["estimated_tokens_delta"])
+                && optional_fields(frame, &["user_message_uuid"], bounded_id)
+        }
+        Some("memory_recall") => {
+            matches!(frame["mode"].as_str(), Some("select" | "synthesize"))
+                && frame["memories"].as_array().is_some_and(|memories| {
+                    memories.iter().all(|m| {
+                        m["path"].is_string()
+                            && matches!(
+                                m["scope"].as_str(),
+                                Some("personal" | "team" | "organization")
+                            )
+                            && optional_fields(m, &["content"], Value::is_string)
+                    })
+                })
+        }
+        Some("model_fallback") => ["trigger", "original_model", "fallback_model", "content"]
+            .iter()
+            .all(|k| frame[*k].is_string()),
+        Some("model_refusal_no_fallback") => {
+            frame["original_model"].is_string()
+                && frame["content"].is_string()
+                && frame
+                    .get("request_id")
+                    .is_some_and(|v| v.is_null() || bounded_id(v))
+                && optional_fields(
+                    frame,
+                    &[
+                        "api_refusal_category",
+                        "api_refusal_explanation",
+                        "refused_user_message_uuid",
+                    ],
+                    |v| v.is_null() || v.is_string(),
+                )
+        }
+        _ => false,
     }
 }
 fn control_id(frame: &Value) -> Result<&str, ()> {
@@ -472,8 +700,9 @@ fn answers(input: &Value, decision: &str) -> Option<Value> {
     let values = answer.as_object()?;
     if values.len() != questions.len()
         || questions.iter().any(|q| {
-            values
-                .get(q["question"].as_str().unwrap())
+            q["question"]
+                .as_str()
+                .and_then(|question| values.get(question))
                 .and_then(Value::as_str)
                 .is_none_or(|s| s.trim().is_empty() || s.len() > 1024)
         })
@@ -561,6 +790,10 @@ mod tests {
                 json!({"role":"assistant","content":"  exact\ntext ' \"  "}),
             ),
             ("message", json!({"role":"user","content":"exact"})),
+            (
+                "message",
+                json!({"role":"user","content":[{"type":"text","text":"  exact\ntext ' \"  "}]}),
+            ),
         ] {
             let mut p = initialized();
             let mut message = replay(submitted(&mut p));
@@ -598,7 +831,7 @@ mod tests {
             ("claude_code_version", "2.1.277"),
         ] {
             let mut p = initialized();
-            let mut event = json!({"type":"system","subtype":"init","session_id":"fixed-session","cwd":"/tmp/trusted","claude_code_version":VERSION,"permissionMode":"default"});
+            let mut event = json!({"type":"system","subtype":"init","uuid":"init-metadata","session_id":"fixed-session","cwd":"/tmp/trusted","claude_code_version":VERSION,"permissionMode":"default"});
             event[field] = json!(value);
             assert!(p.event(event).is_err());
         }
@@ -732,6 +965,221 @@ mod tests {
         }
         assert_eq!(p.cards().len(), 16);
         assert!(p.event(request("overflow", "Bash", json!({}))).is_err());
+    }
+    fn tool_result() -> Value {
+        json!({"type":"user","session_id":"fixed-session","uuid":"tool-output","parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-permission","content":"safe","is_error":false}]},"tool_use_result":{"stdout":"safe"}})
+    }
+    fn rate_limit() -> Value {
+        json!({"type":"rate_limit_event","session_id":"fixed-session","uuid":"rate","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.9}})
+    }
+    fn progress() -> Value {
+        json!({"type":"tool_progress","session_id":"fixed-session","uuid":"progress","tool_use_id":"tool-permission","tool_name":"Bash","parent_tool_use_id":null,"elapsed_time_seconds":1.5,"heartbeat":true})
+    }
+    #[test]
+    fn ordinary_tool_output_never_acknowledges_or_unlocks_input() {
+        for denied in [false, true] {
+            let mut p = initialized();
+            let input = submitted(&mut p);
+            let mut output = tool_result();
+            output["message"]["content"][0]["is_error"] = json!(denied);
+            assert!(p.event(output.clone()).unwrap().is_empty());
+            assert!(p.pending.is_some());
+            p.event(replay(input)).unwrap();
+            assert!(p.event(output).unwrap().is_empty());
+            assert_eq!(p.state, OwnerState::ActiveTurn);
+            assert!(matches!(
+                &p.submit(SubmissionOrigin::Local(2), "blocked".into())[0],
+                Effect::Result(_, SubmissionOutcome::Rejected { .. })
+            ));
+            p.event(json!({"type":"result","session_id":"fixed-session","subtype":"success"}))
+                .unwrap();
+            assert_eq!(p.state, OwnerState::Idle);
+            submitted(&mut p);
+        }
+    }
+    #[test]
+    fn ordinary_information_preserves_bootstrap_pending_permission_and_active_admission() {
+        let mut p = initialized();
+        assert!(p.event(rate_limit()).unwrap().is_empty());
+        assert_eq!(p.state, OwnerState::AwaitingSessionConfirmation);
+        let input = submitted(&mut p);
+        for event in [rate_limit(), progress()] {
+            assert!(p.event(event).unwrap().is_empty());
+            assert!(p.pending.is_some());
+        }
+        p.event(replay(input)).unwrap();
+        p.event(request(
+            "permission",
+            "Bash",
+            json!({"command":"printf safe"}),
+        ))
+        .unwrap();
+        for event in [rate_limit(), progress()] {
+            assert!(p.event(event).unwrap().is_empty());
+            assert_eq!(p.state, OwnerState::PendingPermission);
+        }
+    }
+    #[test]
+    fn settlements_echo_exactly_once_without_accepting_input() {
+        for decision in ["allow", "deny"] {
+            let mut p = initialized();
+            let input = submitted(&mut p);
+            p.event(request(
+                "permission",
+                "Bash",
+                json!({"command":"printf safe"}),
+            ))
+            .unwrap();
+            let reply = write(p.decision(&json!("permission"), decision));
+            assert!(p.event(reply.clone()).unwrap().is_empty());
+            assert!(p.pending.is_some());
+            assert_eq!(p.state, OwnerState::ActiveTurn);
+            assert!(p.event(reply).is_err());
+            p.event(replay(input)).unwrap();
+        }
+    }
+    #[test]
+    fn ordinary_output_rejects_malformed_identity_unknown_and_reset_envelopes() {
+        for event in [tool_result(), rate_limit(), progress()] {
+            for (key, value) in [
+                ("session_id", json!("other")),
+                ("uuid", json!(null)),
+                ("parent_tool_use_id", json!("subagent")),
+                ("agent_id", json!("child")),
+            ] {
+                let mut p = initialized();
+                submitted(&mut p);
+                let mut bad = event.clone();
+                bad[key] = value;
+                assert!(p.event(bad).is_err(), "accepted {key} on {event}");
+                assert!(p.pending.is_some());
+            }
+        }
+        for event in [
+            json!({"type":"user","session_id":"fixed-session","uuid":"output","parent_tool_use_id":null,"message":{"role":"user","content":"not a replay"}}),
+            json!({"type":"tool_progress","session_id":"fixed-session","uuid":"progress","parent_tool_use_id":null,"tool_name":"Bash","tool_use_id":"t","elapsed_time_seconds":-1}),
+            json!({"type":"rate_limit_event","session_id":"fixed-session","uuid":"rate","rate_limit_info":{"status":"unknown"}}),
+            json!({"type":"system","session_id":"fixed-session","uuid":"system","subtype":"unknown"}),
+            json!({"type":"system","session_id":"fixed-session","uuid":"system","subtype":"conversation_reset"}),
+            json!({"type":"system","session_id":"fixed-session","uuid":"system","subtype":"compact_boundary"}),
+            json!({"type":"system","session_id":"fixed-session","uuid":"system","subtype":"model_consent_fallback"}),
+        ] {
+            let mut p = initialized();
+            submitted(&mut p);
+            assert!(p.event(event).is_err());
+            assert!(p.pending.is_some());
+        }
+    }
+    #[test]
+    fn settlement_mismatch_fabrication_cancellation_expiry_and_bound_fail_closed() {
+        for field in ["request_id", "subtype", "response"] {
+            let mut p = initialized();
+            submitted(&mut p);
+            p.event(request(
+                "permission",
+                "Bash",
+                json!({"command":"printf safe"}),
+            ))
+            .unwrap();
+            let reply = write(p.decision(&json!("permission"), "allow"));
+            let mut bad = reply.clone();
+            bad["response"][field] = json!("fabricated");
+            assert!(p.event(bad).is_err());
+            assert_eq!(p.settlements.len(), 1);
+            assert!(p.event(reply).unwrap().is_empty());
+        }
+        let mut p = initialized();
+        let input = submitted(&mut p);
+        p.event(request("cancelled", "Bash", json!({}))).unwrap();
+        p.event(json!({"type":"control_cancel_request","request_id":"cancelled"}))
+            .unwrap();
+        assert!(p
+            .event(permission_response(
+                "cancelled",
+                json!({"behavior":"allow","updatedInput":{}})
+            ))
+            .is_err());
+        // Optional error echoes must match exactly, and may be absent entirely.
+        let error = write(p.event(json!({"type":"control_request","request_id":"unsupported","request":{"subtype":"unknown"}})).unwrap());
+        assert!(p.event(error.clone()).unwrap().is_empty());
+        assert!(p.event(error).is_err());
+        let pending_error = write(p.event(json!({"type":"control_request","request_id":"unechoed","request":{"subtype":"unknown"}})).unwrap());
+        p.event(replay(input)).unwrap();
+        p.event(json!({"type":"result","session_id":"fixed-session","subtype":"success"}))
+            .unwrap();
+        assert!(p.settlements.is_empty());
+        submitted(&mut p);
+        assert!(p.event(pending_error).is_err());
+        for n in 0..16 {
+            p.event(request(&format!("denied-{n}"), "Unknown", json!({})))
+                .unwrap();
+        }
+        assert_eq!(p.settlements.len(), 16);
+        assert!(p.event(request("overflow", "Unknown", json!({}))).is_err());
+    }
+    #[test]
+    fn repeated_pinned_init_and_allowlisted_system_information_do_not_change_admission() {
+        let mut p = initialized();
+        let init = json!({"type":"system","subtype":"init","uuid":"init-metadata","session_id":"fixed-session","cwd":"/tmp/trusted","claude_code_version":VERSION,"permissionMode":"default"});
+        for _ in 0..2 {
+            let input = submitted(&mut p);
+            p.event(init.clone()).unwrap();
+            assert_eq!(p.state, OwnerState::ActiveTurn);
+            assert!(p.pending.is_some());
+            for body in [
+                json!({"subtype":"status","status":null}),
+                json!({"subtype":"notification","key":"n","text":"notice","priority":"low"}),
+                json!({"subtype":"api_retry","attempt":1,"max_retries":3,"retry_delay_ms":100,"error_status":null,"error":"overloaded"}),
+                json!({"subtype":"thinking_tokens","estimated_tokens":10,"estimated_tokens_delta":2}),
+                json!({"subtype":"memory_recall","mode":"select","memories":[{"path":"/tmp/memory","scope":"personal"}]}),
+                json!({"subtype":"model_fallback","trigger":"overloaded","original_model":"a","fallback_model":"b","content":"fallback"}),
+                json!({"subtype":"model_refusal_no_fallback","original_model":"a","content":"declined","request_id":null}),
+            ] {
+                let mut event = body;
+                event["type"] = json!("system");
+                event["session_id"] = json!("fixed-session");
+                event["uuid"] = json!("info");
+                assert!(p.event(event).unwrap().is_empty());
+                assert!(p.pending.is_some());
+            }
+            assert!(p.event(json!({"type":"tool_use_summary","session_id":"fixed-session","uuid":"summary","summary":"safe","preceding_tool_use_ids":["tool"]})).unwrap().is_empty());
+            p.event(replay(input)).unwrap();
+            p.event(json!({"type":"result","session_id":"fixed-session","subtype":"success"}))
+                .unwrap();
+        }
+        for field in ["session_id", "cwd", "claude_code_version"] {
+            let mut bad = init.clone();
+            bad[field] = json!("changed");
+            assert!(p.event(bad).is_err());
+        }
+    }
+    #[test]
+    fn defensive_settlement_overflow_permanently_revokes_without_writes() {
+        let mut p = initialized();
+        let input = submitted(&mut p);
+        p.event(replay(input)).unwrap();
+        p.event(request("permission", "Bash", json!({"command":"safe"})))
+            .unwrap();
+        // White-box corruption: valid displayed cards are much smaller. Exercise
+        // the defensive byte-bound path without relaxing real consent validation.
+        p.cards.get_mut("permission").unwrap().params["input"] =
+            json!({"command":"x".repeat(64 * 1024)});
+        let effects = p.decision(&json!("permission"), "allow");
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Write(_))));
+        assert_eq!(p.state, OwnerState::Revoked);
+        assert!(p.cards.is_empty());
+        assert!(p.settlements.is_empty());
+        assert!(p.decision(&json!("permission"), "allow").is_empty());
+        assert!(p
+            .event(json!({"type":"result","session_id":"fixed-session","subtype":"success"}))
+            .is_err());
+        assert!(!p
+            .submit(SubmissionOrigin::Local(2), "never send".into())
+            .iter()
+            .any(|effect| matches!(effect, Effect::Write(_))));
+        assert_eq!(p.state, OwnerState::Revoked);
     }
     #[test]
     fn launch_is_fixed_session_typed_and_preserves_policy() {

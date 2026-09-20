@@ -1,7 +1,10 @@
 # Integrated agent sessions (experimental)
 
 An integrated session is an explicitly launched Herdr pane whose helper owns one
-Codex app-server process and one fixed thread. Existing shell-launched agents
+provider process and one fixed conversation: a Codex app-server thread or a
+Claude Code session. Codex exact delivery is qualified for the pinned version;
+Claude exact delivery remains unqualified until its separate proof gate.
+Existing shell-launched agents
 continue to use the existing terminal interaction and `agent.prompt` behavior.
 
 ```sh
